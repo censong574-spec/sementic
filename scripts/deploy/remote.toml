@@ -1,0 +1,46 @@
+# Remote runtime config (non-secret). Edit here, then run: scripts/deploy/deploy.ps1 config
+# Secrets (SSH password, LLM API key) go in scripts/deploy/deploy.env — see deploy.env.example.
+
+[local]
+# Path to sementic-gateway repo (relative to this worker repo root, or absolute)
+gateway_path = "../gateway/sementic-gateway"
+
+[server]
+host = "1.95.200.170"
+user = "root"
+remote_root = "/opt/sementic"
+remote_python = "/root/.local/bin/python3.11"
+kafka_bin = "/opt/kafka/bin"
+
+[services]
+gateway = "sementic-gateway"
+worker = "sementic-worker"
+
+[gateway]
+host = "0.0.0.0"
+port = 8081
+redis_url = "redis://127.0.0.1:6379/0"
+redis_bot_status_key_prefix = "status"
+kafka_bootstrap_servers = "127.0.0.1:9092"
+kafka_topic = "im.messages"
+kafka_client_id = "sementic-gateway"
+content_safety_enabled = true
+content_safety_disable = false
+content_safety_static_enabled = true
+content_safety_llm_enabled = true
+content_safety_block_level = 3
+content_safety_fail_closed = false
+content_safety_llm_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+content_safety_llm_model = "qwen-turbo"
+content_safety_llm_timeout_seconds = 10
+content_safety_llm_max_tokens = 512
+
+[worker]
+llm_api_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+llm_model = "qwen-plus-2025-07-28"
+llm_timeout_seconds = 180
+redis_url = "redis://127.0.0.1:6379/0"
+kafka_bootstrap_servers = "127.0.0.1:9092"
+kafka_topic = "im.messages"
+bot_service_base = "http://127.0.0.1"
+redis_key_prefix = "channel:history"
