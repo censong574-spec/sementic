@@ -60,6 +60,14 @@ class BotProfile(BaseModel):
             f"status={status}"
         )
 
+    def sender_can_use(self, sender_user_id: str) -> bool:
+        """Workspace agents from internal API are all usable; legacy registry still checks owner."""
+        if self.share_scope in ("channel_shared", "workspace"):
+            return True
+        if self.multica_agent_id:
+            return True
+        return self.owner_user_id == sender_user_id
+
 
 class PlannerRequest(BaseModel):
     channel_id: str
@@ -69,6 +77,12 @@ class PlannerRequest(BaseModel):
     mentioned_bot_ids: list[str] = Field(default_factory=list)
     available_bots: list[BotProfile]
     current_message: str
+    workspace_id: str | None = None
+    multica_token: str | None = None
+
+    @property
+    def has_workspace_credentials(self) -> bool:
+        return bool((self.workspace_id or "").strip() and (self.multica_token or "").strip())
 
     @model_validator(mode="after")
     def validate_bots_present(self) -> PlannerRequest:

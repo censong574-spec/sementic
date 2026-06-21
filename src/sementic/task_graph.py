@@ -155,16 +155,14 @@ def validate_graph_against_request(
         bot = bots_by_id.get(agent_key)
         if bot is None:
             raise ValueError(f"unknown agent_key: {agent_key}")
-        if not _sender_can_use_bot(request.sender_user_id, bot):
+        if not bot.sender_can_use(request.sender_user_id):
             raise PermissionError(f"sender cannot use bot: {agent_key}")
-        if not bot.is_online:
+        if not bot.is_online and not bot.multica_agent_id:
             raise ValueError(f"bot is offline: {agent_key}")
 
 
 def _sender_can_use_bot(sender_user_id: str, bot: BotProfile) -> bool:
-    if bot.share_scope == "channel_shared":
-        return True
-    return bot.owner_user_id == sender_user_id
+    return bot.sender_can_use(sender_user_id)
 
 
 def slug_graph_id(channel_id: str) -> str:

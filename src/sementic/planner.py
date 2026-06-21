@@ -35,6 +35,8 @@ class Planner:
             available_bots=request.available_bots,
             mentioned_bot_ids=request.mentioned_bot_ids,
             current_message=request.current_message,
+            workspace_id=request.workspace_id,
+            multica_token=request.multica_token,
         )
 
         last_error = "unknown error"
@@ -68,7 +70,7 @@ class Planner:
         allowed_bot_ids = {
             bot.bot_user_id
             for bot in request.available_bots
-            if self._sender_can_use_bot(request.sender_user_id, bot)
+            if bot.sender_can_use(request.sender_user_id)
         }
         if not allowed_bot_ids:
             raise PermissionError("Sender has no usable bots in this channel")
@@ -82,9 +84,3 @@ class Planner:
             raise RuntimeError(
                 "Mentioned bot is offline: " + ", ".join(offline_mentioned)
             )
-
-    @staticmethod
-    def _sender_can_use_bot(sender_user_id: str, bot) -> bool:
-        if bot.share_scope == "channel_shared":
-            return True
-        return bot.owner_user_id == sender_user_id

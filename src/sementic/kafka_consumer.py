@@ -10,19 +10,14 @@ from aiokafka import AIOKafkaConsumer
 
 from sementic.config import KafkaSettings
 from sementic.handler import MessageHandler
-from sementic.im_models import IMMessageEvent, MessageContext, UserContext
+from sementic.im_models import IMMessageEvent
 
 logger = logging.getLogger(__name__)
 
 
 def parse_kafka_ingress_payload(payload: dict[str, Any]) -> IMMessageEvent:
     """Rebuild IMMessageEvent from Gateway Kafka envelope."""
-    return IMMessageEvent(
-        event_id=payload["event_id"],
-        group_session_id=payload["group_session_id"],
-        user_context=UserContext.model_validate(payload["user_context"]),
-        message_context=MessageContext.model_validate(payload["message_context"]),
-    )
+    return IMMessageEvent.model_validate(payload)
 
 
 async def process_kafka_message(

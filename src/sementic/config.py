@@ -43,7 +43,7 @@ class WorkerSettings(BaseSettings):
 
 
 class BotServiceSettings(BaseSettings):
-    """Bot management service; only base address is configurable."""
+    """Multica internal agents listing endpoint (full URL without query string)."""
 
     model_config = SettingsConfigDict(
         env_prefix="SEMENTIC_BOT_",
@@ -52,5 +52,19 @@ class BotServiceSettings(BaseSettings):
         extra="ignore",
     )
 
-    service_base: str = ""
+    agents_url: str = ""
     timeout_seconds: float = 5.0
+
+
+class MulticaSettings(BaseSettings):
+    """Multica control-plane base URL for workspace-scoped agent execution."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SEMENTIC_MULTICA_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    service_base: str = "http://127.0.0.1:8080/api/multica"
+    timeout_seconds: float = 30.0

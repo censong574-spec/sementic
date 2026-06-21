@@ -42,5 +42,5 @@ llm_timeout_seconds = 180
 redis_url = "redis://127.0.0.1:6379/0"
 kafka_bootstrap_servers = "127.0.0.1:9092"
 kafka_topic = "im.messages"
-bot_service_base = "http://127.0.0.1"
+bot_agents_url = "http://127.0.0.1:8080/api/internal/agents"
 redis_key_prefix = "channel:history"

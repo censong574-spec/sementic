@@ -103,10 +103,15 @@ class InMemoryKafkaProducer(KafkaProducer):
 
 
 def _build_kafka_payload(event: IMMessageEvent) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "event_id": event.event_id,
         "group_session_id": event.group_session_id,
         "user_context": event.user_context.model_dump(mode="json"),
         "message_context": event.message_context.model_dump(mode="json"),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
+    if event.workspace_id:
+        payload["workspace_id"] = event.workspace_id
+    if event.multica_token:
+        payload["multica_token"] = event.multica_token
+    return payload

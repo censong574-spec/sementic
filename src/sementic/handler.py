@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel
 
 from sementic.bot_registry import BotRegistry
@@ -10,6 +12,8 @@ from sementic.models import BotProfile, ChatMessage, PlannerRequest, TaskIntentD
 from sementic.task_graph import TaskGraphPlan
 from sementic.planner import Planner
 from sementic.redis_history import RedisHistoryStore, StoredChatMessage
+
+logger = logging.getLogger(__name__)
 
 
 class PlanMessageResponse(BaseModel):
@@ -77,6 +81,7 @@ class MessageHandler:
         owned_bots = await self._resolve_owned_bots(
             sender_user_id=event.user_context.user_id,
             mentions=event.message_context.mentions_registry,
+            event=event,
         )
         if not owned_bots:
             return PlanMessageResponse(
@@ -89,12 +94,26 @@ class MessageHandler:
                 task_intent=task_intent,
             )
 
+        if event.has_workspace_credentials:
+            logger.info(
+                "workspace context present event_id=%s workspace_id=%s has_multica_token=%s",
+                event.event_id,
+                event.workspace_id,
+                bool(event.multica_token),
+            )
+
         planner_request = self._build_planner_request(
             event,
             recent,
             available_bots=owned_bots,
         )
         plan = await self.planner.plan(planner_request)
+        plan = _inject_workspace_context_into_plan(plan, event)
+        logger.info(
+            "task graph plan event_id=%s plan=%s",
+            event.event_id,
+            plan.model_dump_json(ensure_ascii=False),
+        )
 
         return PlanMessageResponse(
             event_id=event.event_id,
@@ -142,6 +161,8 @@ class MessageHandler:
             ],
             available_bots=available_bots,
             current_message=event.message_context.content,
+            workspace_id=event.workspace_id,
+            multica_token=event.multica_token,
         )
 
     async def _resolve_owned_bots(
@@ -149,13 +170,65 @@ class MessageHandler:
         *,
         sender_user_id: str,
         mentions: list[MentionRegistryItem],
+        event: IMMessageEvent,
     ) -> list[BotProfile]:
-        if self.bot_service.enabled:
-            return await self.bot_service.resolve_owned_bots_for_orchestration(
-                sender_user_id=sender_user_id,
-                mentions=mentions,
-            )
-        return self.bot_registry.resolve_owned_bots_for_orchestration(
+        if self.bot_service.enabled and (event.workspace_id or "").strip():
+            try:
+                bots = await self.bot_service.resolve_workspace_agents_for_orchestration(
+                    workspace_id=event.workspace_id or "",
+                    sender_user_id=sender_user_id,
+                    mentions=mentions,
+                )
+                if bots or not event.has_workspace_credentials:
+                    return bots
+                return [_workspace_default_bot(event, sender_user_id=sender_user_id, mentions=mentions)]
+            except Exception as exc:
+                logger.warning(
+                    "bot service unavailable, falling back to local registry: %s",
+                    exc,
+                )
+        bots = self.bot_registry.resolve_owned_bots_for_orchestration(
             sender_user_id=sender_user_id,
             mentions=mentions,
         )
+        if bots or not event.has_workspace_credentials:
+            return bots
+        return [_workspace_default_bot(event, sender_user_id=sender_user_id, mentions=mentions)]
+
+
+def _workspace_default_bot(
+    event: IMMessageEvent,
+    *,
+    sender_user_id: str,
+    mentions: list[MentionRegistryItem],
+) -> BotProfile:
+    if mentions:
+        bot_user_id = mentions[0].entity_id
+    else:
+        bot_user_id = f"workspace:{event.workspace_id}"
+    return BotProfile(
+        bot_user_id=bot_user_id,
+        display_name=bot_user_id,
+        role="Managed workspace agent",
+        expertise=["general", "coding", "multica"],
+        owner_user_id=sender_user_id,
+        share_scope="private",
+        multica_agent_id=event.workspace_id,
+        is_online=True,
+    )
+
+
+def _inject_workspace_context_into_plan(
+    plan: TaskGraphPlan,
+    event: IMMessageEvent,
+) -> TaskGraphPlan:
+    if not event.has_workspace_credentials:
+        return plan
+
+    graph_input = dict(plan.graph.input)
+    graph_input.setdefault("channel_id", event.group_session_id)
+    graph_input.setdefault("user_message", event.message_context.content)
+    graph_input["workspace_id"] = event.workspace_id
+    graph_input["multica_token"] = event.multica_token
+    plan.graph.input = graph_input
+    return plan

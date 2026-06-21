@@ -205,6 +205,8 @@ def build_tarball() -> bytes:
                     for part in path.parts
                 ):
                     continue
+                if path.name == ".env" or path.name.startswith(".env."):
+                    continue
                 if path.is_file() and path.suffix == ".pyc":
                     continue
                 arcname = str(Path(remote_name) / path.relative_to(base)).replace("\\", "/")
@@ -254,7 +256,7 @@ def render_worker_env(settings: DeploySettings) -> str:
         SEMENTIC_REDIS_URL={w["redis_url"]}
         SEMENTIC_KAFKA_BOOTSTRAP_SERVERS={w["kafka_bootstrap_servers"]}
         SEMENTIC_KAFKA_TOPIC={w["kafka_topic"]}
-        SEMENTIC_BOT_SERVICE_BASE={w["bot_service_base"]}
+        SEMENTIC_BOT_AGENTS_URL={w["bot_agents_url"]}
         """
     ).strip() + "\n"
 
@@ -369,6 +371,7 @@ def cmd_code(settings: DeploySettings, *, only: str | None = None) -> None:
     client = connect(settings)
     try:
         upload_code(client, settings)
+        push_config(client, settings)
         restart_services(client, settings, only=only)
         show_status(client, settings)
     finally:

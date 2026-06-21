@@ -118,6 +118,31 @@ async def test_planner_rejects_offline_mentioned_bot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_planner_allows_workspace_agent_without_owner_match() -> None:
+    request = _sample_request(
+        sender_user_id="mattermost-user-1",
+        mentioned_bot_ids=[],
+        available_bots=[
+            BotProfile(
+                bot_user_id="okmbzgnbdfycpqggohr6hnxcte",
+                display_name="hermes-desktop-qbg4054",
+                role="local hermes agent",
+                owner_user_id="1fd0d57b-f3eb-4ea1-b9dd-c2ddca20d29b",
+                share_scope="workspace",
+                multica_agent_id="7630d83b-6b78-483d-bf79-35d9f256b753",
+                is_online=False,
+            )
+        ],
+        current_message="用C语言写一个51单片机点亮LED灯",
+    )
+    planner = Planner(llm=MockLLMClient())
+
+    plan = await planner.plan(request)
+
+    assert plan.graph.nodes
+
+
+@pytest.mark.asyncio
 async def test_planner_rejects_private_bot_for_non_owner() -> None:
     request = _sample_request(
         sender_user_id="user_other",

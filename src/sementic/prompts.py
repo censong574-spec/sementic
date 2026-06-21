@@ -11,7 +11,7 @@ _TASK_GRAPH_OUTPUT_TEMPLATE = """{
     "id": "im-session-id",
     "name": "任务名",
     "graph_type": "control_flow",
-    "input": {"channel_id": "频道ID", "user_message": "用户最新消息"},
+    "input": {"channel_id": "频道ID", "user_message": "用户最新消息", "workspace_id": "可选", "multica_token": "可选"},
     "start": "intake",
     "max_total_visits": 10,
     "nodes": [
@@ -96,14 +96,20 @@ def build_user_prompt(
     available_bots: list[BotProfile],
     mentioned_bot_ids: list[str],
     current_message: str,
+    workspace_id: str | None = None,
+    multica_token: str | None = None,
 ) -> str:
     history = "\n".join(msg.format_line() for msg in recent_messages) or "(no prior messages)"
     bots = "\n".join(bot.format_profile() for bot in available_bots)
     mentioned = ", ".join(mentioned_bot_ids) if mentioned_bot_ids else "(none)"
+    workspace_line = workspace_id or "(none)"
+    multica_line = "present" if multica_token else "missing"
 
     return (
         f"Channel ID: {channel_id}\n"
         f"Sender: {sender_display_name} ({sender_user_id})\n"
+        f"Workspace ID: {workspace_line}\n"
+        f"Multica token: {multica_line}\n"
         f"Mentioned bot IDs: {mentioned}\n\n"
         f"Recent messages:\n{history}\n\n"
         f"Available bots:\n{bots}\n\n"
