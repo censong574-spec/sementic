@@ -386,11 +386,69 @@ class JsonDagWorkflow:
                 dependency_executions,
                 graph_input,
             )
+        if _is_local_operation_node(node_spec):
+            return await self._execute_local_operation_node(
+                node_spec,
+                dependency_executions,
+                graph_input,
+            )
         return await self._execute_agent_node(
             node_spec,
             dependency_executions,
             graph_input,
         )
+
+    async def _execute_local_operation_node(
+        self,
+        node_spec: dict[str, Any],
+        dependency_executions: dict[str, Any],
+        graph_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        node_id = node_spec["id"]
+        node_state = self._nodes[node_id]
+        now = workflow.now().isoformat()
+        node_state["status"] = "running"
+        node_state["started_at"] = now
+        node_state["backend"] = "control-flow"
+        self._record_instance_start(node_spec, "simulator", now)
+
+        operation = str(node_spec.get("operation") or "merge").lower()
+        payload = _run_local_operation_payload(
+            node_spec,
+            dependency_executions,
+            graph_input,
+            self._all_results,
+        )
+
+        finished_at = workflow.now().isoformat()
+        result = {
+            "node": node_id,
+            "operation": operation,
+            "duration_seconds": 0,
+            "payload": payload,
+        }
+        node_state["status"] = "completed"
+        node_state["finished_at"] = finished_at
+        node_state["duration_seconds"] = 0
+        node_state["elapsed_seconds"] = 0
+        node_state["summary"] = f"{operation} completed locally; visit={node_spec.get('_visit', 1)}"
+        self._finish_latest_instance(node_id, "completed", finished_at, node_state["summary"])
+        return {
+            "status": "completed",
+            "result": result,
+            "a2a_task": {
+                "id": f"control-flow-{node_spec['_instance_id']}",
+                "artifacts": [
+                    {
+                        "name": "dag-node-result",
+                        "parts": [{"data": result, "mediaType": "application/json"}],
+                    }
+                ],
+                "metadata": {"backend": "control-flow", "nodeId": node_id, "operation": operation},
+                "status": {"state": "TASK_STATE_COMPLETED"},
+            },
+            "instance_id": node_spec["_instance_id"],
+        }
 
     async def _execute_condition_node(
         self,
@@ -1040,8 +1098,85 @@ def _is_condition_node(node: dict[str, Any]) -> bool:
     return _node_type(node).lower() in {"condition", "decision", "router", "branch"}
 
 
-def _node_backend_for_display(node: dict[str, Any]) -> str:
+def _is_local_operation_node(node: dict[str, Any]) -> bool:
+    """Simulator-style nodes (emit/join/...) run in-workflow without external HTTP."""
     if _is_condition_node(node):
+        return False
+    agent = node.get("agent")
+    if isinstance(agent, dict) and agent:
+        return False
+    operation = str(node.get("operation") or "").lower()
+    return operation != "agent_task"
+
+
+def _run_local_operation_payload(
+    node_spec: dict[str, Any],
+    dependency_executions: dict[str, Any],
+    graph_input: dict[str, Any],
+    results: dict[str, Any],
+) -> dict[str, Any]:
+    operation = str(node_spec.get("operation") or "merge").lower()
+    params = node_spec.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+
+    if operation == "emit":
+        resolved = _resolve_value(params, graph_input, results)
+        return resolved if isinstance(resolved, dict) else {"value": resolved}
+
+    if operation == "join":
+        fields = params.get("fields") or {}
+        if not isinstance(fields, dict):
+            fields = {}
+        return {
+            key: _resolve_value(value, graph_input, results)
+            for key, value in fields.items()
+        }
+
+    if operation == "template":
+        fields = params.get("fields") or {}
+        if not isinstance(fields, dict):
+            fields = {}
+        return {
+            key: _resolve_value(value, graph_input, results)
+            for key, value in fields.items()
+        }
+
+    if operation == "status":
+        return {
+            "status": params.get("status", "ok"),
+            "details": _resolve_value(params.get("details", {}), graph_input, results),
+        }
+
+    if operation == "merge":
+        dep_payloads = {
+            node_id: execution["result"]["payload"]
+            for node_id, execution in dependency_executions.items()
+            if isinstance(execution.get("result"), dict)
+        }
+        return {
+            "params": _resolve_value(params, graph_input, results),
+            "dependencies": dep_payloads,
+        }
+
+    if operation == "count":
+        values = _resolve_value(params.get("values", []), graph_input, results)
+        if not isinstance(values, list):
+            values = [values]
+        return {"count": len(values), "values": values}
+
+    if operation == "percentage_from_count":
+        count = int(_resolve_value(params.get("count", 0), graph_input, results) or 0)
+        multiplier = int(params.get("multiplier", 1))
+        cap = int(params.get("cap", count * multiplier))
+        return {"percent": min(cap, count * multiplier)}
+
+    resolved = _resolve_value(params, graph_input, results)
+    return resolved if isinstance(resolved, dict) else {"value": resolved}
+
+
+def _node_backend_for_display(node: dict[str, Any]) -> str:
+    if _is_condition_node(node) or _is_local_operation_node(node):
         return "control-flow"
     agent = node.get("agent")
     agent_config = agent if isinstance(agent, dict) else {}
@@ -1073,7 +1208,11 @@ def _agent_input_payload(a2a_task: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _node_max_visits(node: dict[str, Any]) -> int:
-    value = node.get("max_visits", node.get("max_attempts", DEFAULT_MAX_NODE_VISITS))
+    value = node.get("max_visits")
+    if value is None:
+        value = node.get("max_attempts")
+    if value is None:
+        value = DEFAULT_MAX_NODE_VISITS
     return max(1, int(value))
 
 

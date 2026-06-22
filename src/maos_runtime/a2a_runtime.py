@@ -494,6 +494,7 @@ def _send_multica_job_message(request: dict[str, Any]) -> dict[str, Any]:
         payload.get("dependency_artifacts", [])
     )
     graph_input = payload.get("graph_input", {})
+    job_auth = _multica_job_auth_from_graph_input(graph_input)
     prompt = _multica_job_prompt(
         node,
         dependency_results,
@@ -515,7 +516,12 @@ def _send_multica_job_message(request: dict[str, Any]) -> dict[str, Any]:
 
     multica_job = _find_multica_job_by_idempotency_key(idempotency_key)
     if multica_job is None:
-        multica_job = _request_multica_job_api("POST", "/api/jobs", create_payload)
+        multica_job = _request_multica_job_api(
+            "POST",
+            "/api/jobs",
+            create_payload,
+            auth=job_auth,
+        )
         if idempotency_key:
             with _MULTICA_JOB_LOCK:
                 _MULTICA_JOB_BY_IDEMPOTENCY[idempotency_key] = copy.deepcopy(multica_job)
@@ -555,6 +561,7 @@ def _send_multica_job_message(request: dict[str, Any]) -> dict[str, Any]:
             "referenceTaskIds": message.get("referenceTaskIds", []),
             "multicaJobId": multica_job_id,
             "multicaJobApiBase": _multica_job_api_base(),
+            "multicaJobAuth": job_auth,
             "agentId": str(agent_id),
             "agentName": agent.get("agent_name") or node.get("agent_name"),
             "contextPolicy": _multica_context_policy(node),
@@ -911,7 +918,13 @@ def _poll_multica_job_task(task_id: str) -> dict[str, Any]:
         task = record["task"]
         metadata = task["metadata"]
     job_id = metadata["multicaJobId"]
-    execution = _request_multica_job_api("GET", f"/api/jobs/{job_id}/execution")
+    job_auth = metadata.get("multicaJobAuth")
+    auth = job_auth if isinstance(job_auth, dict) else {}
+    execution = _request_multica_job_api(
+        "GET",
+        f"/api/jobs/{job_id}/execution",
+        auth=auth,
+    )
     status = str(execution.get("status") or "").lower()
     now = _timestamp()
     elapsed = round(time.time() - float(metadata.get("startedAt", time.time())), 2)
@@ -2227,6 +2240,8 @@ def _request_multica_job_api(
     path: str,
     payload: dict[str, Any] | None = None,
     params: dict[str, str] | None = None,
+    *,
+    auth: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return _request_json(
         _multica_job_api_base(),
@@ -2234,18 +2249,32 @@ def _request_multica_job_api(
         path,
         payload,
         params,
-        headers=_multica_job_headers(),
+        headers=_multica_job_headers(auth),
     )
 
 
-def _multica_job_headers() -> dict[str, str]:
-    token = _multica_job_token()
+def _multica_job_auth_from_graph_input(graph_input: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(graph_input, dict):
+        return {}
+    auth: dict[str, str] = {}
+    token = graph_input.get("multica_token")
+    if token:
+        auth["token"] = str(token).strip()
+    workspace_id = graph_input.get("workspace_id")
+    if workspace_id:
+        auth["workspace_id"] = str(workspace_id).strip()
+    return auth
+
+
+def _multica_job_headers(auth: dict[str, str] | None = None) -> dict[str, str]:
+    auth = auth or {}
+    token = str(auth.get("token") or _multica_job_token()).strip()
     if not token:
         raise RuntimeError("MULTICA_JOB_TOKEN is required for backend=multica_job")
     authorization = token if token.lower().startswith("bearer ") else f"Bearer {token}"
     headers = {"Authorization": authorization}
-    workspace_id = _multica_job_workspace_id()
-    workspace_slug = _multica_job_workspace_slug()
+    workspace_id = str(auth.get("workspace_id") or _multica_job_workspace_id()).strip()
+    workspace_slug = str(auth.get("workspace_slug") or _multica_job_workspace_slug()).strip()
     if workspace_id:
         headers["X-Workspace-ID"] = workspace_id
     elif workspace_slug:
