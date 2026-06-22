@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
     "redis>=5.0.0",
+    "temporalio>=1.28.0,<2.0",
     "uvicorn[standard]>=0.30.0",
 ]
 
@@ -32,7 +33,7 @@ sementic-worker = "sementic.worker_main:main"
 sementic-gateway = "sementic.gateway.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/sementic"]
+packages = ["src/sementic", "src/maos_runtime"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

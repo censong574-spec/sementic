@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("full", "code", "config", "restart", "status", "logs", "messages", "redis", "diagnose")]
+    [ValidateSet("full", "code", "config", "restart", "status", "logs", "messages", "redis", "diagnose", "temporal", "temporal-bundle", "temporal-status", "temporal-logs")]
     [string]$Command = "full",
 
     [ValidateSet("gateway", "worker", "")]
@@ -34,7 +34,7 @@ $argsList = @($Command)
 if ($Only) {
     $argsList += @("--only", $Only)
 }
-if ($Command -in @("logs", "messages", "diagnose")) {
+if ($Command -in @("logs", "messages", "diagnose", "temporal-logs")) {
     $argsList += @("--lines", $Lines.ToString())
 }
 if ($Command -in @("messages", "diagnose")) {

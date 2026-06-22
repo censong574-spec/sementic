@@ -27,6 +27,8 @@ import paramiko
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = Path(__file__).resolve().parent
+TEMPORAL_DIR = SCRIPTS / "temporal"
+TEMPORAL_ARTIFACTS_DIR = TEMPORAL_DIR / "artifacts"
 CONFIG_PATH = SCRIPTS / "remote.toml"
 DEPLOY_ENV_PATH = SCRIPTS / "deploy.env"
 WORKER_LOCAL_ENV = REPO_ROOT / ".env"
@@ -55,8 +57,10 @@ class DeploySettings:
     remote_python: str
     gateway_service: str
     worker_service: str
+    temporal_service: str
     gateway: dict[str, Any]
     worker: dict[str, Any]
+    temporal: dict[str, Any]
     server: dict[str, Any]
 
     @property
@@ -82,6 +86,10 @@ class DeploySettings:
     @property
     def kafka_topic(self) -> str:
         return str(self.gateway.get("kafka_topic", "im.messages"))
+
+    @property
+    def temporal_root(self) -> str:
+        return str(self.temporal.get("remote_root", "/opt/temporal"))
 
 
 def _load_toml_config() -> dict[str, Any]:
@@ -126,8 +134,10 @@ def load_settings(*, host: str | None = None, user: str | None = None, require_l
         remote_python=server["remote_python"],
         gateway_service=services["gateway"],
         worker_service=services["worker"],
+        temporal_service=services.get("temporal", "temporal-server"),
         gateway=cfg["gateway"],
         worker=cfg["worker"],
+        temporal=cfg.get("temporal", {}),
         server=server,
     )
 
@@ -177,9 +187,16 @@ def _safe_print(text: str) -> None:
     sys.stdout.buffer.write(text.rstrip().encode("utf-8", errors="replace") + b"\n")
 
 
-def run(client: paramiko.SSHClient, command: str, *, check: bool = True) -> tuple[int, str, str]:
-    print(f"$ {command}")
-    _, stdout, stderr = client.exec_command(command, get_pty=True)
+def run(
+    client: paramiko.SSHClient,
+    command: str,
+    *,
+    check: bool = True,
+    timeout: float = 600.0,
+) -> tuple[int, str, str]:
+    print(f"$ {command}", flush=True)
+    _, stdout, stderr = client.exec_command(command, get_pty=False, timeout=timeout)
+    stdout.channel.settimeout(timeout + 30.0)
     out = stdout.read().decode("utf-8", errors="replace")
     err = stderr.read().decode("utf-8", errors="replace")
     exit_code = stdout.channel.recv_exit_status()
@@ -194,29 +211,55 @@ def run(client: paramiko.SSHClient, command: str, *, check: bool = True) -> tupl
 def build_tarball() -> bytes:
     cfg = _load_toml_config()
     packages = resolve_packages(cfg)
+    exclude_dirs = {
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".mypy_cache",
+        ".cache",
+        "artifacts",
+    }
     buffer = io.BytesIO()
+    seen: set[str] = set()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
         for base, remote_name in packages:
             if not base.is_dir():
                 raise FileNotFoundError(f"package source not found: {base}")
             for path in base.rglob("*"):
-                if any(
-                    part in {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
-                    for part in path.parts
-                ):
+                if any(part in exclude_dirs for part in path.parts):
                     continue
                 if path.name == ".env" or path.name.startswith(".env."):
                     continue
                 if path.is_file() and path.suffix == ".pyc":
                     continue
                 arcname = str(Path(remote_name) / path.relative_to(base)).replace("\\", "/")
-                tar.add(path, arcname=arcname)
+                if arcname in seen:
+                    continue
+                seen.add(arcname)
+                tar.add(path, arcname=arcname, recursive=False)
     return buffer.getvalue()
 
 
 def upload_bytes(sftp: paramiko.SFTPClient, data: bytes, remote_path: str) -> None:
-    with sftp.file(remote_path, "wb") as remote:
-        remote.write(data)
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        local_path = tmp.name
+    try:
+        sftp.put(local_path, remote_path)
+        remote_size = sftp.stat(remote_path).st_size
+        if remote_size != len(data):
+            raise RuntimeError(
+                f"upload size mismatch for {remote_path}: "
+                f"local={len(data)} remote={remote_size}"
+            )
+    finally:
+        Path(local_path).unlink(missing_ok=True)
 
 
 def render_gateway_env(settings: DeploySettings) -> str:
@@ -257,6 +300,8 @@ def render_worker_env(settings: DeploySettings) -> str:
         SEMENTIC_KAFKA_BOOTSTRAP_SERVERS={w["kafka_bootstrap_servers"]}
         SEMENTIC_KAFKA_TOPIC={w["kafka_topic"]}
         SEMENTIC_BOT_AGENTS_URL={w["bot_agents_url"]}
+        SEMENTIC_MAOS_TEMPORAL_ADDRESS={w.get("maos_temporal_address", "127.0.0.1:7233")}
+        SEMENTIC_MAOS_MULTICA_JOB_API_BASE={w.get("maos_multica_job_api_base", "http://127.0.0.1:8080")}
         """
     ).strip() + "\n"
 
@@ -296,16 +341,18 @@ def upload_code(client: paramiko.SSHClient, settings: DeploySettings) -> None:
     run(client, f"mkdir -p {settings.remote_root}")
     tarball = build_tarball()
     print(f"uploading tarball ({len(tarball)} bytes)")
+    remote_tar = f"{settings.remote_root}/sementic-deploy.tgz"
+    staging = f"{settings.remote_root}/.deploy-staging"
+    run(client, f"rm -f {remote_tar}")
     sftp = client.open_sftp()
     try:
-        remote_tar = f"{settings.remote_root}/sementic-deploy.tgz"
         upload_bytes(sftp, tarball, remote_tar)
     finally:
         sftp.close()
 
-    run(client, f"rm -rf {settings.remote_root}/gateway {settings.remote_root}/sementic")
-    run(client, f"tar -xzf {settings.remote_root}/sementic-deploy.tgz -C {settings.remote_root}")
-    run(client, f"rm -f {settings.remote_root}/sementic-deploy.tgz")
+    run(client, f"rm -rf {settings.remote_root}/gateway {settings.remote_root}/sementic {staging}")
+    run(client, f"tar -xzf {remote_tar} -C {settings.remote_root}")
+    run(client, f"rm -f {remote_tar}")
 
     run(client, f"{settings.remote_python} -m venv {settings.remote_venv}")
     run(client, f"{settings.remote_venv_python} -m pip install --upgrade pip setuptools wheel")
@@ -530,6 +577,222 @@ def cmd_redis(settings: DeploySettings, *, grep: str | None, history_limit: int)
         client.close()
 
 
+def _read_temporal_postgres_password(deploy_env: dict[str, str]) -> str:
+    return (
+        os.environ.get("TEMPORAL_POSTGRES_PASSWORD")
+        or deploy_env.get("TEMPORAL_POSTGRES_PASSWORD", "")
+    )
+
+
+def _temporal_tarball_name(settings: DeploySettings) -> str:
+    version = str(settings.temporal.get("server_version", "1.27.2"))
+    return f"temporal_{version}_linux_amd64.tar.gz"
+
+
+def _temporal_bundle_fallback_dirs(settings: DeploySettings) -> list[str]:
+    raw = settings.temporal.get("bundle_fallback_dirs", "/home/liusong")
+    if isinstance(raw, list):
+        return [str(d).strip() for d in raw if str(d).strip()]
+    return [part.strip() for part in str(raw).split(":") if part.strip()]
+
+
+def temporal_shell_prefix(settings: DeploySettings) -> str:
+    root = settings.temporal_root
+    return f"INSTALL_ROOT={root} ENV_FILE={root}/temporal.env"
+
+
+def render_temporal_env(settings: DeploySettings, *, postgres_password: str = "") -> str:
+    t = settings.temporal
+    root = t.get("remote_root", "/opt/temporal")
+    fallbacks = ":".join(_temporal_bundle_fallback_dirs(settings))
+    lines = [
+        f"INSTALL_ROOT={root}",
+        f"TEMPORAL_PERSISTENCE={t.get('persistence', 'postgres')}",
+        f"TEMPORAL_BIN={root}/bin/temporal",
+        f"TEMPORAL_GRPC_HOST={t.get('grpc_host', '127.0.0.1')}",
+        f"TEMPORAL_GRPC_PORT={t.get('grpc_port', 7233)}",
+        f"TEMPORAL_UI_PORT={t.get('ui_port', 8233)}",
+        f"TEMPORAL_DB_FILE={t.get('db_file', '/opt/temporal/data/temporal.db')}",
+        f"TEMPORAL_SERVICE_NAME={settings.temporal_service}",
+        f"TEMPORAL_NAMESPACE={t.get('namespace', 'default')}",
+        f"TEMPORAL_CLI_VERSION={t.get('cli_version', '1.3.0')}",
+        f"TEMPORAL_SERVER_VERSION={t.get('server_version', '1.27.2')}",
+        f"TEMPORAL_POSTGRES_HOST={t.get('postgres_host', '127.0.0.1')}",
+        f"TEMPORAL_POSTGRES_PORT={t.get('postgres_port', 5432)}",
+        f"TEMPORAL_POSTGRES_USER={t.get('postgres_user', 'temporal')}",
+        f"TEMPORAL_POSTGRES_DB={t.get('postgres_db', 'temporal')}",
+        f"TEMPORAL_POSTGRES_VISIBILITY_DB={t.get('postgres_visibility_db', 'temporal_visibility')}",
+        f"TEMPORAL_POSTGRES_CUSTOM_ROOT={t.get('postgres_custom_root', '/opt/postgresql-14')}",
+        f"TEMPORAL_POSTGRES_ADMIN_SOCKET={t.get('postgres_admin_socket', '/tmp')}",
+        f"TEMPORAL_BUNDLE_FALLBACK_DIRS={fallbacks}",
+        f"SECRETS_FILE={root}/temporal.secrets.env",
+    ]
+    if postgres_password.strip():
+        lines.append(f"TEMPORAL_POSTGRES_PASSWORD={postgres_password.strip()}")
+    return "\n".join(lines) + "\n"
+
+
+def stage_remote_temporal_bundle(client: paramiko.SSHClient, settings: DeploySettings) -> None:
+    """Copy server tarball from remote fallback dirs if artifacts/ is empty."""
+    root = settings.temporal_root
+    name = _temporal_tarball_name(settings)
+    fallbacks = _temporal_bundle_fallback_dirs(settings)
+    dirs_quoted = " ".join(f'"{d}"' for d in fallbacks) or '"/home/liusong"'
+    run(
+        client,
+        f"""
+set -e
+name="{name}"
+dest="{root}/artifacts/$name"
+if [[ -s "$dest" ]]; then
+  echo "artifact ready: $dest ($(stat -c%s "$dest") bytes)"
+  exit 0
+fi
+mkdir -p {root}/artifacts
+for dir in {dirs_quoted}; do
+  if [[ -f "$dir/$name" ]]; then
+    cp -f "$dir/$name" "$dest"
+    echo "staged $dir/$name -> $dest ($(stat -c%s "$dest") bytes)"
+    exit 0
+  fi
+done
+echo "note: no remote bundle in fallback dirs; deploy.sh may download from GitHub"
+""",
+        check=False,
+        timeout=60.0,
+    )
+
+
+def upload_temporal_bundle(
+    client: paramiko.SSHClient,
+    settings: DeploySettings,
+    *,
+    postgres_password: str = "",
+) -> None:
+    deploy_sh = TEMPORAL_DIR / "deploy.sh"
+    server_template = TEMPORAL_DIR / "server.yaml.template"
+    if not deploy_sh.is_file():
+        raise FileNotFoundError(f"missing {deploy_sh}")
+    if not server_template.is_file():
+        raise FileNotFoundError(f"missing {server_template}")
+
+    remote_root = settings.temporal_root
+    remote_deploy = f"{remote_root}/deploy"
+    run(
+        client,
+        f"mkdir -p {remote_deploy} {remote_root}/data {remote_root}/logs "
+        f"{remote_root}/bin {remote_root}/config {remote_root}/server {remote_root}/artifacts",
+    )
+
+    sftp = client.open_sftp()
+    try:
+        upload_bytes(sftp, deploy_sh.read_bytes(), f"{remote_deploy}/deploy.sh")
+        upload_bytes(sftp, server_template.read_bytes(), f"{remote_deploy}/server.yaml.template")
+        upload_bytes(
+            sftp,
+            render_temporal_env(settings, postgres_password=postgres_password).encode("utf-8"),
+            f"{remote_root}/temporal.env",
+        )
+        if postgres_password.strip():
+            secrets = f"TEMPORAL_POSTGRES_PASSWORD={postgres_password.strip()}\n"
+            upload_bytes(sftp, secrets.encode("utf-8"), f"{remote_root}/temporal.secrets.env")
+        tarball = TEMPORAL_ARTIFACTS_DIR / _temporal_tarball_name(settings)
+        if tarball.is_file():
+            remote_tar = f"{remote_root}/artifacts/{tarball.name}"
+            print(f"uploading {tarball.name} ({tarball.stat().st_size} bytes)", flush=True)
+            upload_bytes(sftp, tarball.read_bytes(), remote_tar)
+        else:
+            print(
+                f"local artifact missing: {tarball}\n"
+                f"  download: .\\scripts\\deploy\\temporal\\fetch_temporal_server.ps1\n"
+                f"  or place tarball on remote under {settings.temporal.get('bundle_fallback_dirs', '/home/liusong')}",
+                flush=True,
+            )
+    finally:
+        sftp.close()
+
+    run(client, f"chmod +x {remote_deploy}/deploy.sh")
+    if postgres_password.strip():
+        run(client, f"chmod 600 {remote_root}/temporal.secrets.env")
+    stage_remote_temporal_bundle(client, settings)
+
+
+def cmd_temporal_bundle(settings: DeploySettings) -> None:
+    """Upload deploy scripts + stage server tarball (no install/start)."""
+    deploy_env = _load_dotenv(DEPLOY_ENV_PATH)
+    postgres_password = _read_temporal_postgres_password(deploy_env)
+    client = connect(settings)
+    try:
+        upload_temporal_bundle(client, settings, postgres_password=postgres_password)
+    finally:
+        client.close()
+
+
+def cmd_temporal(settings: DeploySettings) -> None:
+    deploy_env = _load_dotenv(DEPLOY_ENV_PATH)
+    postgres_password = _read_temporal_postgres_password(deploy_env)
+    client = connect(settings)
+    root = settings.temporal_root
+    prefix = temporal_shell_prefix(settings)
+    try:
+        upload_temporal_bundle(client, settings, postgres_password=postgres_password)
+        run(
+            client,
+            f"{prefix} bash {root}/deploy/deploy.sh start",
+            timeout=900.0,
+        )
+    finally:
+        client.close()
+
+
+def _print_temporal_health(client: paramiko.SSHClient, settings: DeploySettings) -> None:
+    t = settings.temporal
+    root = t.get("remote_root", "/opt/temporal")
+    grpc = f"{t.get('grpc_host', '127.0.0.1')}:{t.get('grpc_port', 7233)}"
+    unit = settings.temporal_service
+    socket = t.get("postgres_admin_socket", "/tmp")
+    port = t.get("postgres_port", 5432)
+    cmds = [
+        f"systemctl is-active {unit} postgresql-14-custom 2>/dev/null || true",
+        f"grep -E '^(Description|ExecStart)=' /etc/systemd/system/{unit}.service 2>/dev/null || true",
+        f"ss -tlnp | grep -E ':7233|:5432' || true",
+        f"timeout 10 {root}/bin/temporal operator cluster health --address {grpc} 2>&1 || echo 'health: unavailable'",
+    ]
+    if t.get("persistence", "postgres") == "postgres":
+        cmds.append(
+            f"cd {socket} && runuser -u postgres -- psql -h {socket} -p {port} -Atc "
+            f"\"SELECT datname FROM pg_database WHERE datname LIKE 'temporal%' ORDER BY 1;\" "
+            f"2>/dev/null || echo 'postgres temporal DBs: unavailable'"
+        )
+    for cmd in cmds:
+        print(f"$ {cmd}", flush=True)
+        try:
+            run(client, cmd, check=False, timeout=30.0)
+        except (TimeoutError, OSError) as exc:
+            print(f"(timeout: {exc})", flush=True)
+
+
+def cmd_temporal_status(settings: DeploySettings) -> None:
+    client = connect(settings)
+    try:
+        _print_temporal_health(client, settings)
+    finally:
+        client.close()
+
+
+def cmd_temporal_logs(settings: DeploySettings, *, lines: int) -> None:
+    client = connect(settings)
+    try:
+        prefix = temporal_shell_prefix(settings)
+        run(
+            client,
+            f"{prefix} bash {settings.temporal_root}/deploy/deploy.sh logs {lines}",
+            check=False,
+        )
+    finally:
+        client.close()
+
+
 def cmd_diagnose(settings: DeploySettings, *, since: str, lines: int, grep: str | None) -> None:
     client = connect(settings)
     try:
@@ -542,6 +805,9 @@ def cmd_diagnose(settings: DeploySettings, *, since: str, lines: int, grep: str 
         show_redis(client, settings, grep=grep, history_limit=5)
         print("\n=== kafka / worker ===")
         show_kafka_summary(client, settings)
+        if settings.temporal:
+            print("\n=== temporal server ===")
+            _print_temporal_health(client, settings)
         print(
             textwrap.dedent(
                 """
@@ -563,20 +829,35 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent(
             """
             commands:
-              full       upload code, push config, restart (default)
-              code       upload code + pip install + restart
-              config     push .env + systemd units + restart
-              restart    restart systemd services
-              status     show service status + health check
-              logs       tail journalctl
-              messages   recent gateway ingress logs (what users sent)
-              redis      Redis channel history (+ --grep to search)
-              diagnose   messages + redis + kafka/worker summary
+              full              upload code, push config, restart (default)
+              code              upload code + pip install + restart
+              config            push .env + systemd units + restart
+              restart           restart systemd services
+              status            show service status + health check
+              logs              tail journalctl
+              messages          recent gateway ingress logs (what users sent)
+              redis             Redis channel history (+ --grep to search)
+              diagnose          messages + redis + kafka/worker summary
+              temporal              upload scripts + install/start Temporal Server (PostgreSQL)
+              temporal-bundle       upload scripts + stage server tarball only
+              temporal-status       systemd, gRPC health, postgres DBs
+              temporal-logs         journalctl for temporal-server
             """
         ).strip(),
     )
     deploy_cmds = ("full", "code", "config")
-    ops_cmds = ("restart", "status", "logs", "messages", "redis", "diagnose")
+    ops_cmds = (
+        "restart",
+        "status",
+        "logs",
+        "messages",
+        "redis",
+        "diagnose",
+        "temporal",
+        "temporal-bundle",
+        "temporal-status",
+        "temporal-logs",
+    )
     parser.add_argument(
         "command",
         nargs="?",
@@ -601,7 +882,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     require_llm = args.command in ("full", "code", "config")
-    settings = load_settings(host=args.host, user=args.user, require_llm=require_llm)
+    settings = load_settings(
+        host=args.host,
+        user=args.user,
+        require_llm=require_llm,
+    )
 
     print(f"target: {settings.user}@{settings.host} ({settings.remote_root})")
     print(f"gateway port: {settings.gateway_port}")
@@ -617,6 +902,10 @@ def main() -> None:
         "messages": lambda: cmd_messages(settings, since=args.since, lines=args.lines),
         "redis": lambda: cmd_redis(settings, grep=grep, history_limit=args.history_limit),
         "diagnose": lambda: cmd_diagnose(settings, since=args.since, lines=args.lines, grep=grep),
+        "temporal": lambda: cmd_temporal(settings),
+        "temporal-bundle": lambda: cmd_temporal_bundle(settings),
+        "temporal-status": lambda: cmd_temporal_status(settings),
+        "temporal-logs": lambda: cmd_temporal_logs(settings, lines=args.lines),
     }
     dispatch[args.command]()
 

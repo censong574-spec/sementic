@@ -13,3 +13,4 @@ build/
 .venv/
 venv/
 .cache/
+temporal-data/

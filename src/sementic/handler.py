@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sementic.bot_registry import BotRegistry
 from sementic.bot_service import BotServiceClient
+from sementic.execution.maos_executor import MaosExecutor
+from sementic.execution.plan_enricher import enrich_plan_for_execution
 from sementic.im_models import IMMessageEvent, MentionRegistryItem
 from sementic.intent_classifier import TaskIntentClassifier
 from sementic.models import BotProfile, ChatMessage, PlannerRequest, TaskIntentDecision
@@ -25,6 +28,7 @@ class PlanMessageResponse(BaseModel):
     skip_reason: str | None = None
     task_intent: TaskIntentDecision | None = None
     plan: TaskGraphPlan | None = None
+    maos_task_ids: list[str] = Field(default_factory=list)
 
 
 class MessageHandler:
@@ -36,12 +40,14 @@ class MessageHandler:
         intent_classifier: TaskIntentClassifier | None = None,
         bot_registry: BotRegistry | None = None,
         bot_service: BotServiceClient | None = None,
+        maos_executor: MaosExecutor | None = None,
     ) -> None:
         self.history_store = history_store
         self.planner = planner
         self.intent_classifier = intent_classifier or TaskIntentClassifier()
         self.bot_registry = bot_registry or BotRegistry()
         self.bot_service = bot_service or BotServiceClient()
+        self.maos_executor = maos_executor
 
     async def handle(self, event: IMMessageEvent) -> PlanMessageResponse:
         stored = await self.history_store.append(event)
@@ -109,9 +115,20 @@ class MessageHandler:
         )
         plan = await self.planner.plan(planner_request)
         plan = _inject_workspace_context_into_plan(plan, event)
+
+        maos_task_ids: list[str] = []
+        if self.maos_executor is not None:
+            plan = enrich_plan_for_execution(
+                plan,
+                owned_bots,
+                event_id=event.event_id,
+            )
+            maos_task_ids = await asyncio.to_thread(self.maos_executor.submit_plan, plan)
+
         logger.info(
-            "task graph plan event_id=%s plan=%s",
+            "task graph plan event_id=%s maos_task_ids=%s plan=%s",
             event.event_id,
+            maos_task_ids,
             plan.model_dump_json(ensure_ascii=False),
         )
 
@@ -122,6 +139,7 @@ class MessageHandler:
             history_window_size=len(recent),
             task_intent=task_intent,
             plan=plan,
+            maos_task_ids=maos_task_ids,
         )
 
     @staticmethod
@@ -172,12 +190,13 @@ class MessageHandler:
         mentions: list[MentionRegistryItem],
         event: IMMessageEvent,
     ) -> list[BotProfile]:
-        if self.bot_service.enabled and (event.workspace_id or "").strip():
+        if self.bot_service.enabled and event.has_workspace_credentials:
             try:
                 bots = await self.bot_service.resolve_workspace_agents_for_orchestration(
                     workspace_id=event.workspace_id or "",
                     sender_user_id=sender_user_id,
                     mentions=mentions,
+                    multica_token=event.multica_token or "",
                 )
                 if bots or not event.has_workspace_credentials:
                     return bots

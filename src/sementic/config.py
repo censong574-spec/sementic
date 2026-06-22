@@ -43,7 +43,7 @@ class WorkerSettings(BaseSettings):
 
 
 class BotServiceSettings(BaseSettings):
-    """Multica internal agents listing endpoint (full URL without query string)."""
+    """Multica agents listing endpoint (GET /api/agents, full URL without query)."""
 
     model_config = SettingsConfigDict(
         env_prefix="SEMENTIC_BOT_",
@@ -68,3 +68,22 @@ class MulticaSettings(BaseSettings):
 
     service_base: str = "http://127.0.0.1:8080/api/multica"
     timeout_seconds: float = 30.0
+
+
+class MaosSettings(BaseSettings):
+    """In-process MAOS / Temporal execution (merged from maos_job runtime)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SEMENTIC_MAOS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    temporal_address: str = "127.0.0.1:7233"
+    temporal_namespace: str = "default"
+    startup_timeout_seconds: float = 60.0
+    multica_job_api_base: str = "http://127.0.0.1:8080"
+    multica_job_token: str = ""
+    multica_job_workspace_id: str = ""
+    multica_job_workspace_slug: str = ""

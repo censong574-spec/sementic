@@ -32,12 +32,22 @@ class BotServiceClient:
         query = urlencode({"workspace_id": workspace_id})
         return f"{base}?{query}"
 
-    async def query_workspace_agents(self, workspace_id: str) -> list[BotProfile]:
+    async def query_workspace_agents(
+        self,
+        workspace_id: str,
+        *,
+        multica_token: str,
+    ) -> list[BotProfile]:
         workspace_id = (workspace_id or "").strip()
-        if not self.enabled or not workspace_id:
+        token = (multica_token or "").strip()
+        if not self.enabled or not workspace_id or not token:
             return []
 
         url = self.build_agents_url(workspace_id)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Workspace-ID": workspace_id,
+        }
         logger.info("bot service query url=%s", url)
 
         client = self._http_client or httpx.AsyncClient(
@@ -46,7 +56,7 @@ class BotServiceClient:
         )
         close_client = self._http_client is None
         try:
-            response = await client.get(url)
+            response = await client.get(url, headers=headers)
             response.raise_for_status()
             payload = response.json()
         finally:
@@ -61,10 +71,14 @@ class BotServiceClient:
         workspace_id: str,
         sender_user_id: str,
         mentions: list[MentionRegistryItem],
+        multica_token: str,
     ) -> list[BotProfile]:
         bots_by_id = {
             bot.bot_user_id: bot
-            for bot in await self.query_workspace_agents(workspace_id)
+            for bot in await self.query_workspace_agents(
+                workspace_id,
+                multica_token=multica_token,
+            )
         }
 
         for mention in mentions:
