@@ -10,6 +10,7 @@ from fakeredis.aioredis import FakeRedis
 from sementic.config import ImEgressSettings, RedisSettings
 from sementic.im_egress.client import MattermostPostClient
 from sementic.im_egress.context import build_egress_context
+from sementic.im_egress.mm_ids import mattermost_post_id
 from sementic.im_egress.publisher import ImEgressPublisher
 from sementic.im_egress.result import extract_final_reply_text, iter_agent_node_replies
 from sementic.im_models import IMMessageEvent
@@ -76,8 +77,13 @@ def test_build_egress_context_uses_run_task_agent() -> None:
     assert ctx is not None
     assert ctx.bot_user_id == "bot_codex"
     assert ctx.bot_username == "codex-desktop"
-    assert ctx.root_post_id == "user:123"
+    assert ctx.root_post_id == ""
     assert ctx.channel_id == "channel_1"
+
+
+def test_mattermost_post_id_rejects_composite_event_id() -> None:
+    assert mattermost_post_id("z9a6ejxftirodmpkmewi6zr46r:1782205028115") == ""
+    assert mattermost_post_id("z9a6ejxftirodmpkmewi6zr46r") == "z9a6ejxftirodmpkmewi6zr46r"
 
 
 def test_extract_final_reply_text_from_snapshot() -> None:
@@ -151,7 +157,7 @@ def test_mattermost_client_external_ingress(monkeypatch: pytest.MonkeyPatch) -> 
         result = client.post_reply(
             bot_user_id="bot_codex",
             channel_id="channel_1",
-            root_post_id="root_1",
+            root_post_id="abcdefghijklmnopqrstuvwxyz",
             message="hello mm",
         )
 
@@ -160,7 +166,37 @@ def test_mattermost_client_external_ingress(monkeypatch: pytest.MonkeyPatch) -> 
     assert captured["headers"]["x-mm-external-ingress-token"] == "shared-secret"
     assert captured["headers"]["x-mm-external-post-as-user-id"] == "bot_codex"
     assert captured["json"]["user_id"] == "bot_codex"
-    assert captured["json"]["root_id"] == "root_1"
+    assert captured["json"]["root_id"] == "abcdefghijklmnopqrstuvwxyz"
+
+
+def test_mattermost_client_omits_invalid_root_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content.decode())
+        return httpx.Response(201, json={"id": "post_1"})
+
+    settings = ImEgressSettings(url="http://mattermost.test")
+    client = MattermostPostClient(settings)
+    monkeypatch.setattr(client, "_external_ingress_token", lambda: "shared-secret")
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as http_client:
+
+        def patched_do_post(url, *, headers, payload, bot_user_id):
+            response = http_client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+        client._do_post = patched_do_post  # type: ignore[method-assign]
+        client.post_reply(
+            bot_user_id="bot_codex",
+            channel_id="channel_1",
+            root_post_id="z9a6ejxftirodmpkmewi6zr46r:1782205028115",
+            message="hello mm",
+        )
+
+    assert "root_id" not in captured["json"]
 
 
 @pytest.mark.asyncio
@@ -184,7 +220,7 @@ async def test_im_egress_publisher_posts_final_and_writes_redis() -> None:
     client.post_reply.assert_called_once_with(
         bot_user_id="bot_codex",
         channel_id="channel_1",
-        root_post_id="user:123",
+        root_post_id="",
         message="final result text",
     )
     recent = await history.get_recent("channel_1", count=5)

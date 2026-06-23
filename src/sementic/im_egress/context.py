@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sementic.im_egress.mm_ids import mattermost_post_id
 from sementic.im_egress.models import EgressContext
 from sementic.im_models import IMMessageEvent
 from sementic.models import BotProfile
@@ -30,7 +31,7 @@ def build_egress_context(
     if not bot_user_id:
         return None
 
-    root_post_id = event.message_context.msg_id or event.event_id
+    root_post_id = mattermost_post_id(event.message_context.msg_id)
     return EgressContext(
         event_id=event.event_id,
         channel_id=event.group_session_id,

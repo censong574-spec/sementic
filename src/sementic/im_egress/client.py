@@ -8,6 +8,7 @@ import httpx
 from redis import Redis
 
 from sementic.config import ImEgressSettings, RedisSettings
+from sementic.im_egress.mm_ids import mattermost_post_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +56,11 @@ class MattermostPostClient:
 
         payload: dict[str, Any] = {
             "channel_id": channel_id,
-            "root_id": root_post_id,
             "message": message,
         }
+        root_id = mattermost_post_id(root_post_id)
+        if root_id:
+            payload["root_id"] = root_id
         url = f"{self.settings.url.rstrip('/')}/api/v4/posts"
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -103,8 +106,9 @@ class MattermostPostClient:
             "user_id": bot_user_id,
             "message": message,
         }
-        if root_post_id:
-            payload["root_id"] = root_post_id
+        root_id = mattermost_post_id(root_post_id)
+        if root_id:
+            payload["root_id"] = root_id
 
         url = f"{self.settings.url.rstrip('/')}/api/v4/posts?external_ingress=true"
         headers = {
