@@ -71,3 +71,7 @@ redis_key_prefix = "channel:history"
 # In-process MAOS (merged maos_runtime); requires temporal-server on same host
 maos_temporal_address = "127.0.0.1:7233"
 maos_multica_job_api_base = "http://127.0.0.1:8080"
+
+# Worker-side Mattermost egress (direct post from sementic-worker)
+mm_url = "http://127.0.0.1:8065"
+mm_enabled = true

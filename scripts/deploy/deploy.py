@@ -164,6 +164,76 @@ def _read_llm_key(deploy_env: dict[str, str]) -> str:
     return ""
 
 
+def _read_mm_bot_tokens_json(deploy_env: dict[str, str]) -> str:
+    if deploy_env.get("SEMENTIC_MM_BOT_TOKENS_JSON"):
+        return deploy_env["SEMENTIC_MM_BOT_TOKENS_JSON"]
+    local = _load_dotenv(WORKER_LOCAL_ENV)
+    return local.get("SEMENTIC_MM_BOT_TOKENS_JSON", "")
+
+
+def _read_remote_env_vars(client: paramiko.SSHClient, path: str, prefix: str) -> dict[str, str]:
+    code, stdout, _ = run(
+        client,
+        f"grep '^{prefix}' {path} 2>/dev/null || true",
+        check=False,
+    )
+    if code != 0 or not stdout.strip():
+        return {}
+    out: dict[str, str] = {}
+    for line in stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _resolve_mm_egress_config(
+    client: paramiko.SSHClient,
+    settings: DeploySettings,
+    deploy_env: dict[str, str],
+) -> dict[str, str]:
+    w = settings.worker
+    remote_env_path = f"{settings.remote_root}/sementic/.env"
+    preserved = _read_remote_env_vars(client, remote_env_path, "SEMENTIC_MM_")
+    tokens_json = _read_mm_bot_tokens_json(deploy_env) or preserved.get("SEMENTIC_MM_BOT_TOKENS_JSON", "")
+    default_token = deploy_env.get("SEMENTIC_MM_DEFAULT_BOT_TOKEN") or preserved.get(
+        "SEMENTIC_MM_DEFAULT_BOT_TOKEN", ""
+    )
+    if not tokens_json and not default_token:
+        bridge_paths = [
+            f"{settings.remote_root}/gateway/scripts/mattermost-bridge.env",
+            "/opt/sementic/gateway/scripts/mattermost-bridge.env",
+            "/opt/mattermost-bridge/mattermost-bridge.env",
+        ]
+        for bridge_env in bridge_paths:
+            bridge = _read_remote_env_vars(client, bridge_env, "MATTERMOST_")
+            bridge_token = bridge.get("MATTERMOST_TOKEN", "")
+            if bridge_token:
+                default_token = bridge_token
+                break
+    return {
+        "url": str(w.get("mm_url") or preserved.get("SEMENTIC_MM_URL") or "http://127.0.0.1:8065"),
+        "enabled": str(w.get("mm_enabled", True)).lower(),
+        "bot_tokens_json": tokens_json,
+        "default_bot_token": default_token,
+        "poll_interval_seconds": preserved.get("SEMENTIC_MM_POLL_INTERVAL_SECONDS", "5"),
+        "completion_timeout_seconds": preserved.get("SEMENTIC_MM_COMPLETION_TIMEOUT_SECONDS", "7200"),
+    }
+
+
+def _remote_mm_external_ingress_ready(client: paramiko.SSHClient) -> bool:
+    code, stdout, _ = run(
+        client,
+        "redis-cli GET shared:service_token 2>/dev/null || true",
+        check=False,
+    )
+    if code != 0:
+        return False
+    token = stdout.strip()
+    return bool(token) and token not in {"(nil)", "nil"}
+
+
 def connect(settings: DeploySettings) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -288,22 +358,33 @@ def render_gateway_env(settings: DeploySettings) -> str:
     ).strip() + "\n"
 
 
-def render_worker_env(settings: DeploySettings) -> str:
+def render_worker_env(settings: DeploySettings, *, mm: dict[str, str] | None = None) -> str:
     w = settings.worker
-    return textwrap.dedent(
-        f"""
-        SEMENTIC_LLM_API_BASE={w["llm_api_base"]}
-        SEMENTIC_LLM_API_KEY={settings.llm_key}
-        SEMENTIC_LLM_MODEL={w["llm_model"]}
-        SEMENTIC_LLM_TIMEOUT_SECONDS={w["llm_timeout_seconds"]}
-        SEMENTIC_REDIS_URL={w["redis_url"]}
-        SEMENTIC_KAFKA_BOOTSTRAP_SERVERS={w["kafka_bootstrap_servers"]}
-        SEMENTIC_KAFKA_TOPIC={w["kafka_topic"]}
-        SEMENTIC_BOT_AGENTS_URL={w["bot_agents_url"]}
-        SEMENTIC_MAOS_TEMPORAL_ADDRESS={w.get("maos_temporal_address", "127.0.0.1:7233")}
-        SEMENTIC_MAOS_MULTICA_JOB_API_BASE={w.get("maos_multica_job_api_base", "http://127.0.0.1:8080")}
-        """
-    ).strip() + "\n"
+    mm = mm or {}
+    lines = [
+        f"SEMENTIC_LLM_API_BASE={w['llm_api_base']}",
+        f"SEMENTIC_LLM_API_KEY={settings.llm_key}",
+        f"SEMENTIC_LLM_MODEL={w['llm_model']}",
+        f"SEMENTIC_LLM_TIMEOUT_SECONDS={w['llm_timeout_seconds']}",
+        f"SEMENTIC_REDIS_URL={w['redis_url']}",
+        f"SEMENTIC_KAFKA_BOOTSTRAP_SERVERS={w['kafka_bootstrap_servers']}",
+        f"SEMENTIC_KAFKA_TOPIC={w['kafka_topic']}",
+        f"SEMENTIC_BOT_AGENTS_URL={w['bot_agents_url']}",
+        f"SEMENTIC_MAOS_TEMPORAL_ADDRESS={w.get('maos_temporal_address', '127.0.0.1:7233')}",
+        f"SEMENTIC_MAOS_MULTICA_JOB_API_BASE={w.get('maos_multica_job_api_base', 'http://127.0.0.1:8080')}",
+    ]
+    if mm:
+        lines.extend(
+            [
+                f"SEMENTIC_MM_URL={mm.get('url', 'http://127.0.0.1:8065')}",
+                f"SEMENTIC_MM_ENABLED={mm.get('enabled', 'true')}",
+                f"SEMENTIC_MM_DEFAULT_BOT_TOKEN={mm.get('default_bot_token', '')}",
+                f"SEMENTIC_MM_BOT_TOKENS_JSON={mm.get('bot_tokens_json', '')}",
+                f"SEMENTIC_MM_POLL_INTERVAL_SECONDS={mm.get('poll_interval_seconds', '5')}",
+                f"SEMENTIC_MM_COMPLETION_TIMEOUT_SECONDS={mm.get('completion_timeout_seconds', '7200')}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
 
 
 def render_systemd_unit(name: str, workdir: str, exec_cmd: str) -> str:
@@ -363,10 +444,18 @@ def upload_code(client: paramiko.SSHClient, settings: DeploySettings) -> None:
 
 
 def push_config(client: paramiko.SSHClient, settings: DeploySettings) -> None:
+    deploy_env = _load_dotenv(DEPLOY_ENV_PATH)
+    mm = _resolve_mm_egress_config(client, settings, deploy_env)
     gateway_env = render_gateway_env(settings)
-    worker_env = render_worker_env(settings)
+    worker_env = render_worker_env(settings, mm=mm)
     run(client, f"cat > {settings.remote_root}/gateway/.env <<'EOF'\n{gateway_env}EOF")
     run(client, f"cat > {settings.remote_root}/sementic/.env <<'EOF'\n{worker_env}EOF")
+    if _remote_mm_external_ingress_ready(client):
+        print("worker mm egress: external_ingress via redis shared:service_token")
+    elif mm.get("bot_tokens_json") or mm.get("default_bot_token"):
+        print("worker mm egress: configured (bot token present)")
+    else:
+        print("worker mm egress: WARNING no auth — posts will be skipped")
 
     gateway_cmd = f"{settings.remote_venv_python} -m gateway.main"
     worker_cmd = f"{settings.remote_venv_python} -m sementic.worker_main"

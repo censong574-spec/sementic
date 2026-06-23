@@ -9,6 +9,9 @@ from sementic.bot_registry import BotRegistry
 from sementic.bot_service import BotServiceClient
 from sementic.execution.maos_executor import MaosExecutor
 from sementic.execution.plan_enricher import enrich_plan_for_execution
+from sementic.im_egress.context import build_egress_context
+from sementic.im_egress.publisher import ImEgressPublisher
+from sementic.im_egress.watcher import MaosCompletionWatcher
 from sementic.im_models import IMMessageEvent, MentionRegistryItem
 from sementic.intent_classifier import TaskIntentClassifier
 from sementic.models import BotProfile, ChatMessage, PlannerRequest, TaskIntentDecision
@@ -41,6 +44,8 @@ class MessageHandler:
         bot_registry: BotRegistry | None = None,
         bot_service: BotServiceClient | None = None,
         maos_executor: MaosExecutor | None = None,
+        im_egress: ImEgressPublisher | None = None,
+        maos_completion_watcher: MaosCompletionWatcher | None = None,
     ) -> None:
         self.history_store = history_store
         self.planner = planner
@@ -48,6 +53,8 @@ class MessageHandler:
         self.bot_registry = bot_registry or BotRegistry()
         self.bot_service = bot_service or BotServiceClient()
         self.maos_executor = maos_executor
+        self.im_egress = im_egress
+        self.maos_completion_watcher = maos_completion_watcher
 
     async def handle(self, event: IMMessageEvent) -> PlanMessageResponse:
         stored = await self.history_store.append(event)
@@ -116,6 +123,8 @@ class MessageHandler:
         plan = await self.planner.plan(planner_request)
         plan = _inject_workspace_context_into_plan(plan, event)
 
+        egress_context = build_egress_context(event, plan, owned_bots)
+
         maos_task_ids: list[str] = []
         if self.maos_executor is not None:
             plan = enrich_plan_for_execution(
@@ -124,6 +133,15 @@ class MessageHandler:
                 event_id=event.event_id,
             )
             maos_task_ids = await asyncio.to_thread(self.maos_executor.submit_plan, plan)
+            if (
+                egress_context
+                and maos_task_ids
+                and self.maos_completion_watcher is not None
+            ):
+                self.maos_completion_watcher.watch(
+                    task_id=maos_task_ids[0],
+                    context=egress_context,
+                )
 
         logger.info(
             "task graph plan event_id=%s maos_task_ids=%s plan=%s",

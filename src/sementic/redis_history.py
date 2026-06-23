@@ -58,6 +58,29 @@ class RedisHistoryStore:
 
         return message
 
+    async def append_bot_reply(
+        self,
+        *,
+        group_session_id: str,
+        bot_user_id: str,
+        bot_username: str,
+        content: str,
+        msg_id: str | None = None,
+    ) -> StoredChatMessage:
+        message = StoredChatMessage(
+            msg_id=msg_id or f"egress:{bot_user_id}:{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+            sender_id=bot_user_id,
+            sender_name=bot_username,
+            content=content,
+            is_bot=True,
+        )
+        key = self._key(group_session_id)
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.lpush(key, message.to_json())
+            pipe.ltrim(key, 0, self.settings.max_messages - 1)
+            await pipe.execute()
+        return message
+
     async def get_recent(
         self,
         group_session_id: str,
