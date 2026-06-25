@@ -2,6 +2,7 @@
 
 Deploy (from worker repo root):
   python scripts/deploy/deploy.py full
+  python scripts/deploy/deploy.py cleanup
   python scripts/deploy/deploy.py diagnose
 
 Config:
@@ -29,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = Path(__file__).resolve().parent
 TEMPORAL_DIR = SCRIPTS / "temporal"
 TEMPORAL_ARTIFACTS_DIR = TEMPORAL_DIR / "artifacts"
+CLEANUP_SH = SCRIPTS / "cleanup.sh"
 CONFIG_PATH = SCRIPTS / "remote.toml"
 DEPLOY_ENV_PATH = SCRIPTS / "deploy.env"
 WORKER_LOCAL_ENV = REPO_ROOT / ".env"
@@ -387,13 +389,24 @@ def render_worker_env(settings: DeploySettings, *, mm: dict[str, str] | None = N
     return "\n".join(lines) + "\n"
 
 
-def render_systemd_unit(name: str, workdir: str, exec_cmd: str) -> str:
+def render_systemd_unit(
+    name: str,
+    workdir: str,
+    exec_cmd: str,
+    *,
+    after: list[str] | None = None,
+    wants: list[str] | None = None,
+) -> str:
+    unit_after = ["network.target", "redis.service", *(after or [])]
+    unit_wants = ["redis.service", *(wants or [])]
+    after_line = "After=" + " ".join(unit_after)
+    wants_line = "Wants=" + " ".join(unit_wants)
     return textwrap.dedent(
         f"""
         [Unit]
         Description={name}
-        After=network.target redis.service
-        Wants=redis.service
+        {after_line}
+        {wants_line}
 
         [Service]
         Type=simple
@@ -460,6 +473,14 @@ def push_config(client: paramiko.SSHClient, settings: DeploySettings) -> None:
     gateway_cmd = f"{settings.remote_venv_python} -m gateway.main"
     worker_cmd = f"{settings.remote_venv_python} -m sementic.worker_main"
 
+    postgres_service = str(settings.temporal.get("postgres_service", "postgresql-14-custom"))
+    temporal_service = settings.temporal_service
+    worker_after = [f"{temporal_service}.service"]
+    worker_wants = [f"{temporal_service}.service"]
+    if settings.temporal.get("persistence", "postgres") == "postgres":
+        worker_after.insert(0, f"{postgres_service}.service")
+        worker_wants.insert(0, f"{postgres_service}.service")
+
     run(
         client,
         f"cat > /etc/systemd/system/{settings.gateway_service}.service <<'EOF'\n"
@@ -468,7 +489,7 @@ def push_config(client: paramiko.SSHClient, settings: DeploySettings) -> None:
     run(
         client,
         f"cat > /etc/systemd/system/{settings.worker_service}.service <<'EOF'\n"
-        f"{render_systemd_unit(settings.worker_service, f'{settings.remote_root}/sementic', worker_cmd)}EOF",
+        f"{render_systemd_unit(settings.worker_service, f'{settings.remote_root}/sementic', worker_cmd, after=worker_after, wants=worker_wants)}EOF",
     )
     run(client, "systemctl daemon-reload")
     run(client, f"systemctl enable {settings.gateway_service} {settings.worker_service}")
@@ -480,10 +501,77 @@ def restart_services(client: paramiko.SSHClient, settings: DeploySettings, *, on
     time.sleep(2)
 
 
+def _temporal_auto_deploy(settings: DeploySettings) -> bool:
+    if not settings.temporal:
+        return False
+    return bool(settings.temporal.get("auto_deploy", True))
+
+
+def _should_ensure_temporal(settings: DeploySettings, *, only: str | None) -> bool:
+    if not _temporal_auto_deploy(settings):
+        return False
+    return only != "gateway"
+
+
+def _temporal_grpc_healthy(client: paramiko.SSHClient, settings: DeploySettings) -> bool:
+    t = settings.temporal
+    root = settings.temporal_root
+    grpc = f"{t.get('grpc_host', '127.0.0.1')}:{t.get('grpc_port', 7233)}"
+    _, out, _ = run(
+        client,
+        f"timeout 5 {root}/bin/temporal operator cluster health --address {grpc} 2>&1",
+        check=False,
+        timeout=20.0,
+    )
+    return "SERVING" in out
+
+
+def ensure_temporal_stack(
+    client: paramiko.SSHClient,
+    settings: DeploySettings,
+    *,
+    force: bool = False,
+) -> None:
+    if not settings.temporal:
+        return
+    if not force and _temporal_grpc_healthy(client, settings):
+        print("temporal already SERVING; skipping temporal deploy", flush=True)
+        return
+    deploy_env = _load_dotenv(DEPLOY_ENV_PATH)
+    postgres_password = _read_temporal_postgres_password(deploy_env)
+    upload_temporal_bundle(client, settings, postgres_password=postgres_password)
+    root = settings.temporal_root
+    prefix = temporal_shell_prefix(settings)
+    print("deploying temporal stack (postgres bootstrap + temporal-server)...", flush=True)
+    run(
+        client,
+        f"{prefix} bash {root}/deploy/deploy.sh start",
+        timeout=900.0,
+    )
+
+
 def show_status(client: paramiko.SSHClient, settings: DeploySettings) -> None:
     names = f"{settings.gateway_service} {settings.worker_service}"
     run(client, f"systemctl --no-pager --full status {names}", check=False)
     run(client, f"curl -s http://127.0.0.1:{settings.gateway_port}/health || true", check=False)
+    if settings.temporal:
+        t = settings.temporal
+        observer_port = int(t.get("observer_port", 8766))
+        postgres_service = str(t.get("postgres_service", "postgresql-14-custom"))
+        temporal_unit = settings.temporal_service
+        run(
+            client,
+            f"systemctl is-active {temporal_unit} {postgres_service} 2>/dev/null || true",
+            check=False,
+        )
+        root = settings.temporal_root
+        grpc = f"{t.get('grpc_host', '127.0.0.1')}:{t.get('grpc_port', 7233)}"
+        run(
+            client,
+            f"timeout 5 {root}/bin/temporal operator cluster health --address {grpc} 2>&1 || true",
+            check=False,
+        )
+        run(client, f"curl -s http://127.0.0.1:{observer_port}/health || true", check=False)
 
 
 def show_logs(client: paramiko.SSHClient, settings: DeploySettings, *, only: str | None, lines: int) -> None:
@@ -497,6 +585,8 @@ def cmd_full(settings: DeploySettings, *, only: str | None = None) -> None:
         run(client, f"{settings.remote_python} --version")
         upload_code(client, settings)
         push_config(client, settings)
+        if _should_ensure_temporal(settings, only=only):
+            ensure_temporal_stack(client, settings)
         restart_services(client, settings, only=only)
         show_status(client, settings)
     finally:
@@ -508,6 +598,8 @@ def cmd_code(settings: DeploySettings, *, only: str | None = None) -> None:
     try:
         upload_code(client, settings)
         push_config(client, settings)
+        if _should_ensure_temporal(settings, only=only):
+            ensure_temporal_stack(client, settings)
         restart_services(client, settings, only=only)
         show_status(client, settings)
     finally:
@@ -529,6 +621,42 @@ def cmd_restart(settings: DeploySettings, *, only: str | None = None) -> None:
     try:
         restart_services(client, settings, only=only)
         show_status(client, settings)
+    finally:
+        client.close()
+
+
+def _cleanup_env_exports(settings: DeploySettings) -> str:
+    t = settings.temporal or {}
+    pairs = {
+        "SEMENTIC_REMOTE_ROOT": settings.remote_root,
+        "TEMPORAL_ROOT": settings.temporal_root,
+        "GATEWAY_SERVICE": settings.gateway_service,
+        "WORKER_SERVICE": settings.worker_service,
+        "TEMPORAL_SERVICE": settings.temporal_service,
+        "POSTGRES_CUSTOM_ROOT": str(t.get("postgres_custom_root", "/opt/postgresql-14")),
+        "POSTGRES_SERVICE": str(t.get("postgres_service", "postgresql-14-custom")),
+        "POSTGRES_PORT": str(t.get("postgres_port", 5432)),
+        "GATEWAY_PORT": str(settings.gateway_port),
+        "OBSERVER_PORT": str(t.get("observer_port", 8766)),
+        "TEMPORAL_GRPC_PORT": str(t.get("grpc_port", 7233)),
+    }
+    return " ".join(f"{key}={value}" for key, value in pairs.items())
+
+
+def cmd_cleanup(settings: DeploySettings) -> None:
+    if not CLEANUP_SH.is_file():
+        raise FileNotFoundError(f"missing {CLEANUP_SH}")
+    script = CLEANUP_SH.read_bytes()
+    encoded = base64.b64encode(script).decode()
+    env = _cleanup_env_exports(settings)
+    client = connect(settings)
+    try:
+        print("cleaning up remote deploy artifacts...", flush=True)
+        run(
+            client,
+            f"{env} bash -c 'echo {encoded} | base64 -d | bash'",
+            timeout=120.0,
+        )
     finally:
         client.close()
 
@@ -694,6 +822,7 @@ def render_temporal_env(settings: DeploySettings, *, postgres_password: str = ""
     t = settings.temporal
     root = t.get("remote_root", "/opt/temporal")
     fallbacks = ":".join(_temporal_bundle_fallback_dirs(settings))
+    postgres_service = str(t.get("postgres_service", "postgresql-14-custom"))
     lines = [
         f"INSTALL_ROOT={root}",
         f"TEMPORAL_PERSISTENCE={t.get('persistence', 'postgres')}",
@@ -713,6 +842,7 @@ def render_temporal_env(settings: DeploySettings, *, postgres_password: str = ""
         f"TEMPORAL_POSTGRES_VISIBILITY_DB={t.get('postgres_visibility_db', 'temporal_visibility')}",
         f"TEMPORAL_POSTGRES_CUSTOM_ROOT={t.get('postgres_custom_root', '/opt/postgresql-14')}",
         f"TEMPORAL_POSTGRES_ADMIN_SOCKET={t.get('postgres_admin_socket', '/tmp')}",
+        f"TEMPORAL_POSTGRES_SERVICE={postgres_service}",
         f"TEMPORAL_BUNDLE_FALLBACK_DIRS={fallbacks}",
         f"SECRETS_FILE={root}/temporal.secrets.env",
     ]
@@ -759,9 +889,12 @@ def upload_temporal_bundle(
     postgres_password: str = "",
 ) -> None:
     deploy_sh = TEMPORAL_DIR / "deploy.sh"
+    bootstrap_sh = TEMPORAL_DIR / "bootstrap_postgres.sh"
     server_template = TEMPORAL_DIR / "server.yaml.template"
     if not deploy_sh.is_file():
         raise FileNotFoundError(f"missing {deploy_sh}")
+    if not bootstrap_sh.is_file():
+        raise FileNotFoundError(f"missing {bootstrap_sh}")
     if not server_template.is_file():
         raise FileNotFoundError(f"missing {server_template}")
 
@@ -776,6 +909,7 @@ def upload_temporal_bundle(
     sftp = client.open_sftp()
     try:
         upload_bytes(sftp, deploy_sh.read_bytes(), f"{remote_deploy}/deploy.sh")
+        upload_bytes(sftp, bootstrap_sh.read_bytes(), f"{remote_deploy}/bootstrap_postgres.sh")
         upload_bytes(sftp, server_template.read_bytes(), f"{remote_deploy}/server.yaml.template")
         upload_bytes(
             sftp,
@@ -800,7 +934,7 @@ def upload_temporal_bundle(
     finally:
         sftp.close()
 
-    run(client, f"chmod +x {remote_deploy}/deploy.sh")
+    run(client, f"chmod +x {remote_deploy}/deploy.sh {remote_deploy}/bootstrap_postgres.sh")
     if postgres_password.strip():
         run(client, f"chmod 600 {remote_root}/temporal.secrets.env")
     stage_remote_temporal_bundle(client, settings)
@@ -818,18 +952,9 @@ def cmd_temporal_bundle(settings: DeploySettings) -> None:
 
 
 def cmd_temporal(settings: DeploySettings) -> None:
-    deploy_env = _load_dotenv(DEPLOY_ENV_PATH)
-    postgres_password = _read_temporal_postgres_password(deploy_env)
     client = connect(settings)
-    root = settings.temporal_root
-    prefix = temporal_shell_prefix(settings)
     try:
-        upload_temporal_bundle(client, settings, postgres_password=postgres_password)
-        run(
-            client,
-            f"{prefix} bash {root}/deploy/deploy.sh start",
-            timeout=900.0,
-        )
+        ensure_temporal_stack(client, settings, force=True)
     finally:
         client.close()
 
@@ -839,10 +964,11 @@ def _print_temporal_health(client: paramiko.SSHClient, settings: DeploySettings)
     root = t.get("remote_root", "/opt/temporal")
     grpc = f"{t.get('grpc_host', '127.0.0.1')}:{t.get('grpc_port', 7233)}"
     unit = settings.temporal_service
+    postgres_service = str(t.get("postgres_service", "postgresql-14-custom"))
     socket = t.get("postgres_admin_socket", "/tmp")
     port = t.get("postgres_port", 5432)
     cmds = [
-        f"systemctl is-active {unit} postgresql-14-custom 2>/dev/null || true",
+        f"systemctl is-active {unit} {postgres_service} 2>/dev/null || true",
         f"grep -E '^(Description|ExecStart)=' /etc/systemd/system/{unit}.service 2>/dev/null || true",
         f"ss -tlnp | grep -E ':7233|:5432' || true",
         f"timeout 10 {root}/bin/temporal operator cluster health --address {grpc} 2>&1 || echo 'health: unavailable'",
@@ -918,8 +1044,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent(
             """
             commands:
-              full              upload code, push config, restart (default)
-              code              upload code + pip install + restart
+              full              upload code, push config, temporal+postgres, restart (default)
+              code              upload code + pip install + temporal check + restart
               config            push .env + systemd units + restart
               restart           restart systemd services
               status            show service status + health check
@@ -927,10 +1053,11 @@ def build_parser() -> argparse.ArgumentParser:
               messages          recent gateway ingress logs (what users sent)
               redis             Redis channel history (+ --grep to search)
               diagnose          messages + redis + kafka/worker summary
-              temporal              upload scripts + install/start Temporal Server (PostgreSQL)
+              temporal              upload scripts + bootstrap PG + start Temporal Server
               temporal-bundle       upload scripts + stage server tarball only
               temporal-status       systemd, gRPC health, postgres DBs
               temporal-logs         journalctl for temporal-server
+              cleanup               stop services, remove dirs/units/logs/user
             """
         ).strip(),
     )
@@ -946,6 +1073,7 @@ def build_parser() -> argparse.ArgumentParser:
         "temporal-bundle",
         "temporal-status",
         "temporal-logs",
+        "cleanup",
     )
     parser.add_argument(
         "command",
@@ -995,6 +1123,7 @@ def main() -> None:
         "temporal-bundle": lambda: cmd_temporal_bundle(settings),
         "temporal-status": lambda: cmd_temporal_status(settings),
         "temporal-logs": lambda: cmd_temporal_logs(settings, lines=args.lines),
+        "cleanup": lambda: cmd_cleanup(settings),
     }
     dispatch[args.command]()
 

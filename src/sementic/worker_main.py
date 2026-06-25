@@ -6,7 +6,7 @@ import time
 from redis.asyncio import Redis
 
 from sementic.bot_registry import BotRegistry
-from sementic.config import ImEgressSettings, KafkaSettings, MaosSettings, RedisSettings, WorkerSettings
+from sementic.config import ImEgressSettings, KafkaSettings, MaosObserverSettings, MaosSettings, RedisSettings, WorkerSettings
 from sementic.execution.maos_executor import MaosExecutor
 from sementic.handler import MessageHandler
 from sementic.im_egress.client import MattermostPostClient
@@ -15,6 +15,7 @@ from sementic.im_egress.watcher import MaosCompletionWatcher
 from sementic.intent_classifier import TaskIntentClassifier
 from sementic.kafka_consumer import KafkaConsumerThread
 from sementic.llm import MockIntentLLMClient, create_intent_llm_client, create_llm_client
+from sementic.maos_observer.server import start_observer_server_if_enabled
 from sementic.planner import Planner
 from sementic.redis_history import RedisHistoryStore
 
@@ -81,20 +82,26 @@ def main() -> None:
     kafka_settings = KafkaSettings()
     redis_settings = RedisSettings()
     maos_settings = MaosSettings()
+    observer_settings = MaosObserverSettings()
 
     logger.info(
-        "sementic worker starting redis=%s kafka=%s topic=%s group=%s maos_temporal=%s mm_egress=%s",
+        "sementic worker starting redis=%s kafka=%s topic=%s group=%s maos_temporal=%s mm_egress=%s observer=%s",
         redis_settings.url,
         kafka_settings.bootstrap_servers,
         kafka_settings.topic,
         kafka_settings.group_id,
         maos_settings.temporal_address,
         ImEgressSettings().url or "(disabled)",
+        f"http://0.0.0.0:{observer_settings.port}"
+        if observer_settings.enabled
+        else "(disabled)",
     )
 
     maos_executor = build_maos_executor()
     info = maos_executor.runtime_info()
     logger.info("MAOS runtime info=%s", info)
+
+    start_observer_server_if_enabled(maos_executor, observer_settings)
 
     redis_client = Redis.from_url(redis_settings.url, decode_responses=True)
     handler = build_message_handler(redis_client, maos_executor=maos_executor)

@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("full", "code", "config", "restart", "status", "logs", "messages", "redis", "diagnose", "temporal", "temporal-bundle", "temporal-status", "temporal-logs")]
+    [ValidateSet("full", "code", "config", "restart", "status", "logs", "messages", "redis", "diagnose", "temporal", "temporal-bundle", "temporal-status", "temporal-logs", "cleanup")]
     [string]$Command = "full",
 
     [ValidateSet("gateway", "worker", "")]

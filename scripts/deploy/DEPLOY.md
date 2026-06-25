@@ -1,10 +1,10 @@
 # 远程部署（Worker 仓库）
 
-将 Gateway + Worker 部署到远端服务器。脚本位于本仓库 `scripts/deploy/`；Gateway 源码路径在 `remote.toml` 的 `[local] gateway_path` 配置。
+将 Gateway + Worker + Temporal（MAOS 依赖）部署到远端服务器。脚本位于本仓库 `scripts/deploy/`；Gateway 源码路径在 `remote.toml` 的 `[local] gateway_path` 配置。
 
 | 文件 | 是否入库 | 内容 |
 |------|----------|------|
-| `scripts/deploy/remote.toml` | 是 | 远端主机、端口、Kafka/Redis、Gateway 本地路径 |
+| `scripts/deploy/remote.toml` | 是 | 远端主机、端口、Kafka/Redis、Temporal/PostgreSQL |
 | `scripts/deploy/deploy.env` | 否 | SSH 密码、LLM API Key |
 
 ## 首次准备
@@ -17,156 +17,148 @@ pip install -r scripts/deploy/requirements-deploy.txt
 copy scripts\deploy\deploy.env.example scripts\deploy\deploy.env
 # 填写 DEPLOY_SSH_PASSWORD；LLM Key 可留空（会读仓库根目录 .env）
 
-# 若 Gateway 仓库不在默认相对路径，编辑 scripts/deploy/remote.toml：
-# [local]
-# gateway_path = "../gateway/sementic-gateway"
+# 下载 Temporal Server 安装包（云主机无法访问 GitHub 时必需）
+.\scripts\deploy\temporal\fetch_temporal_server.ps1
+
+# 远端需已安装 PostgreSQL 二进制到 /opt/postgresql-14（Temporal 专用，见下文）
 ```
 
 ## 常用命令
 
-在 **Worker 仓库根目录** 执行：
-
 ```powershell
-.\scripts\deploy\deploy.ps1 full
-.\scripts\deploy\deploy.ps1 code
-.\scripts\deploy\deploy.ps1 config
+.\scripts\deploy\deploy.ps1 full          # 代码 + 配置 + Temporal/PG + 重启
+.\scripts\deploy\deploy.ps1 code          # 只更新代码
+.\scripts\deploy\deploy.ps1 cleanup       # 卸载全部部署产物
 .\scripts\deploy\deploy.ps1 diagnose
-.\scripts\deploy\deploy.ps1 messages
-.\scripts\deploy\deploy.ps1 redis -Grep "消息片段"
-```
-
-或：
-
-```powershell
-python scripts/deploy/deploy.py diagnose
+.\scripts\deploy\deploy.ps1 temporal-status
 ```
 
 ## 子命令
 
 | 命令 | 作用 |
 |------|------|
-| `full` | 上传 Gateway + Worker 代码、写配置、重启 |
-| `code` | 只更新代码并重启 |
+| `full` | 上传代码、写配置、**自动部署 Temporal + PostgreSQL**、重启 gateway/worker |
+| `code` | 只更新代码；Temporal 非 SERVING 时同样会自动修复 |
 | `config` | 只更新远端 `.env` 和 systemd |
 | `restart` / `status` / `logs` | 运维 |
 | `messages` / `redis` / `diagnose` | 远端排查 |
-| `temporal` | 上传脚本 + 安装/启动 Temporal Server（PostgreSQL 持久化） |
-| `temporal-bundle` | 只上传脚本并 staging 安装包（不启动） |
+| `temporal` | 强制重新部署 Temporal（含 PG bootstrap） |
+| `temporal-bundle` | 只上传脚本/安装包（不启动） |
 | `temporal-status` / `temporal-logs` | Temporal 运维 |
+| `cleanup` | **卸载**：停服务、删目录、删 systemd 单元、清 journal、删 postgres 用户（若无进程） |
 
-## Temporal Server（独立微服务）
+## cleanup（卸载全部部署产物）
 
-Standalone **Temporal Server 1.27.x**，供 sementic-worker 内嵌 MAOS 使用。与 multica-server **共用同一台 PostgreSQL 14**（`127.0.0.1:5432`），使用独立库与用户：
+```powershell
+.\scripts\deploy\deploy.ps1 cleanup
+```
+
+会清理（不影响 Mattermost/Multica/Kafka/Redis）：
+
+| 类型 | 内容 |
+|------|------|
+| systemd | `sementic-gateway`、`sementic-worker`、`temporal-server`、`postgresql-14-custom` |
+| 目录 | `/opt/sementic`、`/opt/temporal`、`/opt/postgresql-14/data`、`/opt/postgresql-14/logs` |
+| 端口进程 | 8081、8766、7233、5432 上残留监听 |
+| journal | 上述服务的 journal 条目 |
+| 用户 | `postgres` 用户/组（仅当无 postgres 进程时） |
+
+**保留：** `/opt/postgresql-14` 二进制（若预先安装）、Mattermost/Multica 内置 PG、Kafka、Redis。
+
+## 部署栈（一次 `full` 会做什么）
+
+```
+full
+ ├── 上传 gateway + worker 代码，pip install
+ ├── 写入 .env + systemd（worker 依赖 temporal-server + postgresql-14-custom）
+ ├── [auto_deploy] Temporal 栈
+ │    ├── bootstrap_postgres.sh   → 若 :5432 不可达则 init + systemd
+ │    ├── 创建 temporal / temporal_visibility 库
+ │    ├── schema 迁移 + btree_gin
+ │    └── 启动 temporal-server (:7233)
+ └── 重启 sementic-gateway / sementic-worker
+```
+
+`remote.toml` 中 `auto_deploy = true`（默认）控制 `full`/`code` 是否自动跑 Temporal。Temporal 已 **SERVING** 时会跳过以节省时间。
+
+## PostgreSQL 说明（重要）
+
+机器上可能有多个 PostgreSQL，**不要混用**：
+
+| 端口 | 归属 | 用途 |
+|------|------|------|
+| **5432** | `postgresql-14-custom` | **Temporal 专用**（deploy 自动 bootstrap） |
+| 55432 | Mattermost 内置 | 仅 Mattermost |
+| 55433 | Multica 内置 | 仅 Multica |
+
+Temporal 使用独立库 `temporal`、`temporal_visibility`，用户 `temporal`。与 Mattermost/Multica **不共用**实例。
+
+**前提：** 远端 `/opt/postgresql-14/bin/initdb` 等二进制需已安装。若目录不存在，需先在机器上安装 PostgreSQL 14 到该路径。
+
+Bootstrap 脚本：`scripts/deploy/temporal/bootstrap_postgres.sh`（由 `deploy.sh` 在 PG 不可达时自动调用）。
+
+## Temporal Server
 
 | 资源 | 值 |
 |------|-----|
 | gRPC | `127.0.0.1:7233` |
-| PostgreSQL DB | `temporal`, `temporal_visibility` |
-| PG 用户 | `temporal` |
-| systemd | `temporal-server` |
+| UI | `127.0.0.1:8233` |
+| MAOS 观测 UI | `0.0.0.0:8766`（worker 内嵌） |
+| systemd | `temporal-server`、`postgresql-14-custom` |
 | 远端目录 | `/opt/temporal` |
 
-MAOS 连接：`SEMENTIC_MAOS_TEMPORAL_ADDRESS=127.0.0.1:7233`（worker 进程内，无需单独 maos_job 服务）
+MAOS 连接：`SEMENTIC_MAOS_TEMPORAL_ADDRESS=127.0.0.1:7233`
 
-### Worker 内嵌 MAOS
+### 提供 Temporal 安装包
 
-`maos_runtime` 已合并进 sementic-worker 进程。`remote.toml` `[worker]` 示例：
-
-```toml
-maos_temporal_address = "127.0.0.1:7233"
-maos_multica_job_api_base = "http://127.0.0.1:8080"
-```
-
-部署后 `deploy.ps1 config` 会写入 worker `.env`。Multica 凭证优先来自 IM 消息的 `graph.input`（`workspace_id` / `multica_token`）。
-
-### 首次部署（三选一提供安装包）
-
-云主机若无法访问 GitHub，需先把 `temporal_*_linux_amd64.tar.gz` 放到本机或远端：
-
-**方式 A — 本地下载后随 deploy 上传（推荐）**
+**方式 A — 本地上传（推荐）**
 
 ```powershell
 .\scripts\deploy\temporal\fetch_temporal_server.ps1
-.\scripts\deploy\deploy.ps1 temporal
+.\scripts\deploy\deploy.ps1 full
 ```
 
-**方式 B — 安装包已在云主机某目录（如 `/home/liusong/`）**
+**方式 B — 安装包已在远端**（配置 `bundle_fallback_dirs`）
 
-在 `remote.toml` 配置 `bundle_fallback_dirs`，然后：
-
-```powershell
-.\scripts\deploy\deploy.ps1 temporal
-```
-
-**方式 C — 只同步脚本/配置，不启动**
+**方式 C — 只同步脚本**
 
 ```powershell
 .\scripts\deploy\deploy.ps1 temporal-bundle
-# SSH 到远端手动: bash /opt/temporal/deploy/deploy.sh start
+# SSH: bash /opt/temporal/deploy/deploy.sh start
 ```
 
-### 日常运维
+### 配置项（remote.toml `[temporal]`）
 
-```powershell
-.\scripts\deploy\deploy.ps1 temporal-status
-.\scripts\deploy\deploy.ps1 temporal-logs
-.\scripts\deploy\deploy.ps1 temporal          # 更新脚本后重新 deploy + restart
-.\scripts\deploy\deploy.ps1 diagnose          # 含 Temporal 健康检查
-```
+| 键 | 说明 |
+|----|------|
+| `auto_deploy` | `full`/`code` 是否自动部署 Temporal（默认 true） |
+| `postgres_custom_root` | PG 安装路径，默认 `/opt/postgresql-14` |
+| `postgres_service` | systemd 单元名，默认 `postgresql-14-custom` |
+| `postgres_admin_socket` | admin 连接 socket 目录，默认 `/tmp` |
+| `bundle_fallback_dirs` | 远端预置 tarball 搜索路径 |
 
-### 配置说明
-
-| 文件 | 作用 |
-|------|------|
-| `scripts/deploy/remote.toml` `[temporal]` | 版本、端口、PG 路径、`bundle_fallback_dirs` |
-| `scripts/deploy/deploy.env` | `TEMPORAL_POSTGRES_PASSWORD`（可选，留空则远端自动生成） |
-| `/opt/temporal/temporal.env` | 远端运行时环境（deploy 写入） |
-| `/opt/temporal/temporal.secrets.env` | 远端 PG 密码（首次自动生成） |
-| `/opt/temporal/config/development.yaml` | temporal-server 配置 |
-
-`deploy.sh` 会自动：创建 PG 库/用户、用 embedded schema 迁移、编译 `btree_gin` 扩展（visibility 需要）、安装 systemd 并以 PostgreSQL 模式启动。
-
-**注意：** 自定义 PG 安装在 `/opt/postgresql-14`，admin 连接走 Unix socket `/tmp`（见 `postgres_admin_socket`），不要用 `psql -h 127.0.0.1`（会卡在密码提示）。
-
-### 验证 PostgreSQL 模式
-
-`temporal-status` 中 `ExecStart` 应为：
-
-```
-/opt/temporal/server/temporal-server --root /opt/temporal --config config --allow-no-auth start
-```
-
-gRPC health 应返回 `SERVING`（不是 `temporal server start-dev`）。
-
-## Gateway 仓库（sementic-gateway）
-
-Mattermost Bridge 脚本在 Gateway 仓库内：
-
-- `scripts/mattermost_bridge.py`
-- `scripts/mattermost-bridge.env.example` → 复制为 `scripts/mattermost-bridge.env`（已 gitignore）
-
-Bridge 同机部署时：
-
-```
-GATEWAY_URL=http://127.0.0.1:8081/api/v1/im/messages
-```
+密码：`deploy.env` 中 `TEMPORAL_POSTGRES_PASSWORD`（可选，留空则远端自动生成）。
 
 ## 远端目录
 
 ```
 /opt/sementic/
 ├── venv/
-├── gateway/    # sementic-gateway
-└── sementic/   # worker（本仓库）
+├── gateway/
+└── sementic/
 
-/opt/temporal/  # Temporal Server（见 temporal-status）
+/opt/postgresql-14/     # Temporal 专用 PG（bootstrap 创建 data/）
+/opt/temporal/
 ├── deploy/deploy.sh
+├── deploy/bootstrap_postgres.sh
 ├── temporal.env
-├── config/development.yaml
-├── server/temporal-server
-└── artifacts/
+└── server/temporal-server
 ```
 
 ## 故障排查
 
-见 `diagnose` 子命令。Gateway 日志 action：`FILTERED`（L1 噪声）、`BLOCKED`（内容安全）、`ASYNC_PROCESSING`（已进 Kafka）。
+- Worker 启动报 `Connection refused 127.0.0.1:7233` → 跑 `.\scripts\deploy\deploy.ps1 temporal` 或 `full`
+- Temporal 报 `cannot connect to PostgreSQL` → 确认 `/opt/postgresql-14/bin/initdb` 存在，再 `temporal`
+- `diagnose` 含 gateway 消息、Redis、Kafka、Temporal 健康检查
+
+Gateway 日志 action：`FILTERED`（L1 噪声）、`BLOCKED`（内容安全）、`ASYNC_PROCESSING`（已进 Kafka）。

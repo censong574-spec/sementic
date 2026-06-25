@@ -54,6 +54,11 @@ class MaosExecutor:
             raise RuntimeError("MaosExecutor is not started")
         return self._service.task_snapshot(task_id)
 
+    def tasks_snapshot(self) -> dict[str, Any]:
+        if self._service is None:
+            raise RuntimeError("MaosExecutor is not started")
+        return self._service.snapshot()
+
     def runtime_info(self) -> dict[str, Any]:
         if self._service is None:
             return {"runtime_status": "not_started"}

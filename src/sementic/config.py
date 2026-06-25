@@ -89,6 +89,21 @@ class MaosSettings(BaseSettings):
     multica_job_workspace_slug: str = ""
 
 
+class MaosObserverSettings(BaseSettings):
+    """Read-only MAOS task monitor (HTTP API + UI), colocated with worker."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SEMENTIC_MAOS_OBSERVER_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = True
+    port: int = 8766
+    refresh_seconds: float = 5.0
+
+
 class ImEgressSettings(BaseSettings):
     """Worker-side Mattermost egress via Mattermost external_ingress (Redis shared token)."""
 

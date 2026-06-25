@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MAOS 任务观测</title>
+  <link rel="stylesheet" href="/static/graph.css" />
+  <style>
+    .observer-toolbar select { min-width: 120px; }
+    .export-link { text-decoration: none; color: inherit; display: inline-flex; align-items: center; height: 36px; padding: 0 14px; border: 1px solid var(--line); background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <main>
+      <div class="topbar">
+        <div>
+          <h1>MAOS 任务观测</h1>
+          <div class="subtle" id="runtimeMeta">加载中…</div>
+        </div>
+        <div class="toolbar-actions observer-toolbar">
+          <label>
+            筛选
+            <select id="statusFilter">
+              <option value="active" selected>进行中</option>
+              <option value="all">全部</option>
+              <option value="running">running</option>
+              <option value="failed">failed</option>
+              <option value="completed">completed</option>
+            </select>
+          </label>
+          <button type="button" id="refreshBtn">刷新</button>
+          <a class="export-link" id="exportLink" href="/api/tasks/export?status=active">导出 JSON</a>
+        </div>
+      </div>
+      <div id="errorBox" class="error"></div>
+      <section class="dashboard">
+        <div class="dashboard-head">
+          <div class="dashboard-title">任务列表</div>
+          <div class="muted" id="updatedAt">-</div>
+        </div>
+        <div class="board-scroll">
+          <table class="task-board">
+            <thead>
+              <tr>
+                <th>任务</th>
+                <th>状态</th>
+                <th>节点</th>
+                <th>IM event</th>
+                <th>提交时间</th>
+              </tr>
+            </thead>
+            <tbody id="taskBoardBody">
+              <tr><td colspan="5" class="muted">暂无任务</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <div class="canvas-wrap">
+        <svg id="graphSvg" role="img" aria-label="MAOS control-flow execution graph"></svg>
+      </div>
+    </main>
+    <aside>
+      <h2>节点统计</h2>
+      <div class="progress">
+        <div class="metric"><strong id="completedCount">0</strong><span>Done</span></div>
+        <div class="metric"><strong id="runningCount">0</strong><span>Running</span></div>
+        <div class="metric"><strong id="suspendedCount">0</strong><span>Suspended</span></div>
+        <div class="metric"><strong id="pendingCount">0</strong><span>Waiting</span></div>
+        <div class="metric"><strong id="failedCount">0</strong><span>Failed</span></div>
+      </div>
+      <h2>控制流</h2>
+      <div class="detail cf-summary" id="controlFlowSummary">选择任务以查看分支与循环状态。</div>
+      <h2>选中节点</h2>
+      <div class="detail" id="nodeDetail">在左侧图中点击节点。</div>
+      <h2>Agent 输入</h2>
+      <div class="detail agent-input-panel" id="agentInput">选择 multica_job 节点查看注入内容。</div>
+      <h2>Agent 输出</h2>
+      <div class="detail final-output-panel" id="agentFinalOutput">选择 agent 节点查看输出。</div>
+      <h2>执行 Trace</h2>
+      <div class="detail trace-panel" id="agentTrace">workflow 状态内嵌结果。</div>
+      <h2>Workflow Result</h2>
+      <div class="detail"><pre id="resultBox">等待选择任务…</pre></div>
+    </aside>
+  </div>
+  <script src="/static/graph.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

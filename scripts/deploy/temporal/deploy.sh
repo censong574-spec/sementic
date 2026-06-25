@@ -42,6 +42,7 @@ POSTGRES_PASSWORD="${TEMPORAL_POSTGRES_PASSWORD:-}"
 TEMPORAL_BUNDLE_FALLBACK_DIRS="${TEMPORAL_BUNDLE_FALLBACK_DIRS:-/home/liusong}"
 POSTGRES_CUSTOM_ROOT="${TEMPORAL_POSTGRES_CUSTOM_ROOT:-/opt/postgresql-14}"
 POSTGRES_ADMIN_SOCKET="${TEMPORAL_POSTGRES_ADMIN_SOCKET:-/tmp}"
+POSTGRES_SERVICE_NAME="${TEMPORAL_POSTGRES_SERVICE:-postgresql-14-custom}"
 
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -55,6 +56,7 @@ POSTGRES_PASSWORD="${TEMPORAL_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}"
 TEMPORAL_BUNDLE_FALLBACK_DIRS="${TEMPORAL_BUNDLE_FALLBACK_DIRS:-/home/liusong}"
 POSTGRES_CUSTOM_ROOT="${TEMPORAL_POSTGRES_CUSTOM_ROOT:-$POSTGRES_CUSTOM_ROOT}"
 POSTGRES_ADMIN_SOCKET="${TEMPORAL_POSTGRES_ADMIN_SOCKET:-$POSTGRES_ADMIN_SOCKET}"
+POSTGRES_SERVICE_NAME="${TEMPORAL_POSTGRES_SERVICE:-$POSTGRES_SERVICE_NAME}"
 
 TEMPORAL_BIN="${TEMPORAL_BIN:-$INSTALL_ROOT/bin/temporal}"
 TEMPORAL_SERVER_BIN="${TEMPORAL_SERVER_BIN:-$SERVER_DIR/temporal-server}"
@@ -148,17 +150,33 @@ psql_admin() {
   (cd /tmp && runuser -u postgres -- psql -h "$POSTGRES_ADMIN_SOCKET" -p "$POSTGRES_PORT" -v ON_ERROR_STOP=1 "$@")
 }
 
-setup_postgres() {
-  step "Preparing PostgreSQL role/databases on ${POSTGRES_HOST}:${POSTGRES_PORT}"
-  ensure_postgres_password
-  if ! systemctl is-active --quiet postgresql-14-custom 2>/dev/null && \
-     ! systemctl is-active --quiet postgresql 2>/dev/null; then
-    echo "warning: postgresql systemd unit not active; continuing if port is open" >&2
+ensure_postgres_host() {
+  step "Checking PostgreSQL host ${POSTGRES_HOST}:${POSTGRES_PORT}"
+  if psql_admin -Atc "SELECT 1" >/dev/null 2>&1; then
+    echo "PostgreSQL admin reachable via ${POSTGRES_ADMIN_SOCKET}:${POSTGRES_PORT}"
+    return 0
   fi
-  if ! psql_admin -Atc "SELECT 1" >/dev/null 2>&1; then
-    echo "cannot connect to PostgreSQL via socket ${POSTGRES_ADMIN_SOCKET}:${POSTGRES_PORT}" >&2
+  local bootstrap="${SCRIPT_DIR}/bootstrap_postgres.sh"
+  if [[ ! -f "$bootstrap" ]]; then
+    echo "PostgreSQL unreachable and missing ${bootstrap}" >&2
     exit 1
   fi
+  step "Bootstrapping PostgreSQL at ${POSTGRES_CUSTOM_ROOT}"
+  POSTGRES_CUSTOM_ROOT="$POSTGRES_CUSTOM_ROOT" \
+  POSTGRES_PORT="$POSTGRES_PORT" \
+  POSTGRES_ADMIN_SOCKET="$POSTGRES_ADMIN_SOCKET" \
+  POSTGRES_SERVICE_NAME="$POSTGRES_SERVICE_NAME" \
+    bash "$bootstrap"
+  if ! psql_admin -Atc "SELECT 1" >/dev/null 2>&1; then
+    echo "cannot connect to PostgreSQL via socket ${POSTGRES_ADMIN_SOCKET}:${POSTGRES_PORT} after bootstrap" >&2
+    exit 1
+  fi
+}
+
+setup_postgres() {
+  step "Preparing PostgreSQL role/databases on ${POSTGRES_HOST}:${POSTGRES_PORT}"
+  ensure_postgres_host
+  ensure_postgres_password
   if ! psql_admin -Atc "SELECT 1 FROM pg_roles WHERE rolname='${POSTGRES_USER}'" | grep -q 1; then
     psql_admin -c "CREATE USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';"
   else
@@ -377,8 +395,8 @@ install_systemd_postgres() {
 [Unit]
 Description=Temporal Server (PostgreSQL persistence)
 Documentation=https://docs.temporal.io
-After=network-online.target postgresql-14-custom.service
-Wants=network-online.target
+After=network-online.target ${POSTGRES_SERVICE_NAME}.service
+Wants=network-online.target ${POSTGRES_SERVICE_NAME}.service
 
 [Service]
 Type=simple
