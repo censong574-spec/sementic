@@ -75,7 +75,7 @@ full
  │    ├── bootstrap_postgres.sh   → 若 :5432 不可达则 init + systemd
  │    ├── 创建 temporal / temporal_visibility 库
  │    ├── schema 迁移 + btree_gin
- │    └── 启动 temporal-server (:7233)
+ │    └── 启动 temporal-server (:7233) + 注册 default namespace
  └── 重启 sementic-gateway / sementic-worker
 ```
 
@@ -158,6 +158,7 @@ MAOS 连接：`SEMENTIC_MAOS_TEMPORAL_ADDRESS=127.0.0.1:7233`
 ## 故障排查
 
 - Worker 启动报 `Connection refused 127.0.0.1:7233` → 跑 `.\scripts\deploy\deploy.ps1 temporal` 或 `full`
+- Worker/MAOS 报 `Namespace default is not found` → `.\scripts\deploy\deploy.ps1 temporal`（会走 `deploy.sh start` 并自动注册 namespace）
 - Temporal 报 `cannot connect to PostgreSQL` → 确认 `/opt/postgresql-14/bin/initdb` 存在，再 `temporal`
 - `diagnose` 含 gateway 消息、Redis、Kafka、Temporal 健康检查
 

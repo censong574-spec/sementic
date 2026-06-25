@@ -106,6 +106,38 @@ wait_grpc() {
   return 1
 }
 
+ensure_namespace() {
+  # PostgreSQL-backed temporal-server does not auto-create namespaces (unlike
+  # start-dev --namespace). MAOS/worker expect TEMPORAL_NAMESPACE (default).
+  step "Ensuring Temporal namespace '${NAMESPACE}'"
+  if [[ ! -x "$TEMPORAL_BIN" ]]; then
+    echo "Temporal CLI missing at ${TEMPORAL_BIN}" >&2
+    return 1
+  fi
+  local addr="${GRPC_HOST}:${GRPC_PORT}"
+  if "$TEMPORAL_BIN" operator namespace describe \
+      --namespace "$NAMESPACE" \
+      --address "$addr" >/dev/null 2>&1; then
+    echo "namespace '${NAMESPACE}' already registered"
+    return 0
+  fi
+  if "$TEMPORAL_BIN" operator namespace register \
+      --namespace "$NAMESPACE" \
+      --address "$addr"; then
+    echo "registered namespace '${NAMESPACE}'"
+    return 0
+  fi
+  # Another process may have registered between describe and register.
+  if "$TEMPORAL_BIN" operator namespace describe \
+      --namespace "$NAMESPACE" \
+      --address "$addr" >/dev/null 2>&1; then
+    echo "namespace '${NAMESPACE}' already registered (race)"
+    return 0
+  fi
+  echo "failed to register namespace '${NAMESPACE}'" >&2
+  return 1
+}
+
 ensure_postgres_password() {
   if [[ -n "$POSTGRES_PASSWORD" ]]; then
     return 0
@@ -469,6 +501,7 @@ cmd_start() {
   systemctl restart "$SERVICE_NAME"
   sleep 4
   wait_grpc 45
+  ensure_namespace
   systemctl --no-pager --full status "$SERVICE_NAME" || true
   echo ""
   echo "Temporal gRPC:  ${GRPC_HOST}:${GRPC_PORT}"
