@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 import httpx
 
 from sementic.config import BotServiceSettings
+from sementic.im_internal_token import resolve_im_internal_token
 from sementic.im_models import MentionRegistryItem, Ownership
 from sementic.models import BotProfile
 
@@ -27,27 +28,37 @@ class BotServiceClient:
     def enabled(self) -> bool:
         return bool(self.settings.agents_url.strip())
 
-    def build_agents_url(self, workspace_id: str) -> str:
+    def build_agents_url(self, team_id: str, owner_user_id: str) -> str:
         base = self.settings.agents_url.rstrip("/")
-        query = urlencode({"workspace_id": workspace_id})
+        query = urlencode(
+            {
+                "team_id": team_id.strip(),
+                "owner_user_id": owner_user_id.strip(),
+            }
+        )
         return f"{base}?{query}"
 
-    async def query_workspace_agents(
+    async def query_mattermost_agents(
         self,
-        workspace_id: str,
-        *,
-        multica_token: str,
+        team_id: str,
+        owner_user_id: str,
     ) -> list[BotProfile]:
-        workspace_id = (workspace_id or "").strip()
-        token = (multica_token or "").strip()
-        if not self.enabled or not workspace_id or not token:
+        team_id = (team_id or "").strip()
+        owner_user_id = (owner_user_id or "").strip()
+        if not self.enabled or not team_id or not owner_user_id:
             return []
 
-        url = self.build_agents_url(workspace_id)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "X-Workspace-ID": workspace_id,
-        }
+        token = resolve_im_internal_token()
+        if not token:
+            logger.warning(
+                "bot service: no IM internal token "
+                "(MULTICA_IM_INTERNAL_TOKEN / HERMES_INTERNAL_BRIDGE_TOKEN / %s)",
+                "/etc/mattermost-hermes-im-internal-token",
+            )
+            return []
+
+        url = self.build_agents_url(team_id, owner_user_id)
+        headers = {"Authorization": f"Bearer {token}"}
         logger.info("bot service query url=%s", url)
 
         client = self._http_client or httpx.AsyncClient(
@@ -63,22 +74,19 @@ class BotServiceClient:
             if close_client:
                 await client.aclose()
 
-        return _parse_workspace_agents(payload)
+        return _parse_mattermost_im_agents(payload)
 
     async def resolve_workspace_agents_for_orchestration(
         self,
         *,
-        workspace_id: str,
+        team_id: str,
+        owner_user_id: str,
         sender_user_id: str,
         mentions: list[MentionRegistryItem],
-        multica_token: str,
     ) -> list[BotProfile]:
         bots_by_id = {
             bot.bot_user_id: bot
-            for bot in await self.query_workspace_agents(
-                workspace_id,
-                multica_token=multica_token,
-            )
+            for bot in await self.query_mattermost_agents(team_id, owner_user_id)
         }
 
         for mention in mentions:
@@ -99,40 +107,41 @@ class BotServiceClient:
         return list(bots_by_id.values())
 
 
-def _parse_workspace_agents(payload: Any) -> list[BotProfile]:
-    if not isinstance(payload, list):
-        raise RuntimeError("bot service expected JSON array of agents")
+def _parse_mattermost_im_agents(payload: Any) -> list[BotProfile]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("bot service expected JSON object with agents array")
+
+    items = payload.get("agents")
+    if not isinstance(items, list):
+        raise RuntimeError("bot service expected JSON object with agents array")
 
     bots: list[BotProfile] = []
-    for item in payload:
+    for item in items:
         if not isinstance(item, dict):
             continue
-        runtime_config = item.get("runtime_config") or {}
-        if not isinstance(runtime_config, dict):
-            runtime_config = {}
 
-        bot_user_id = str(runtime_config.get("bot_id") or item.get("id") or "").strip()
+        bot_user_id = str(item.get("bot_id") or "").strip()
         if not bot_user_id:
             continue
 
-        name = str(item.get("name") or bot_user_id).strip()
-        description = str(item.get("description") or "").strip()
-        instructions = str(item.get("instructions") or "").strip()
-        provider = str(runtime_config.get("provider") or "").strip()
+        name = str(item.get("agent_name") or item.get("bot_username") or bot_user_id).strip()
+        provider = str(item.get("runtime_provider") or "").strip()
         expertise = [provider] if provider else ["general"]
         status = str(item.get("status") or "offline").strip()
-        owner_id = str(item.get("owner_id") or "").strip()
+        owner_id = str(item.get("owner_user_id") or "").strip()
+        runtime_status = str(item.get("runtime_status") or "").strip()
+        is_online = status != "offline" and runtime_status != "offline"
 
         bots.append(
             BotProfile(
                 bot_user_id=bot_user_id,
                 display_name=name,
-                role=description or instructions or "assistant",
+                role=name or "assistant",
                 expertise=expertise,
                 owner_user_id=owner_id or None,
-                share_scope=str(item.get("visibility") or "private"),
-                multica_agent_id=str(item.get("id") or "").strip() or None,
-                is_online=status != "offline",
+                share_scope="private",
+                multica_agent_id=str(item.get("agent_id") or "").strip() or None,
+                is_online=is_online,
             )
         )
     return bots

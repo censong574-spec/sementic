@@ -34,6 +34,7 @@ def test_im_event_lifts_top_level_workspace_fields() -> None:
         {
             "event_id": "evt_1",
             "group_session_id": "room_1",
+            "team_id": "team-top",
             "workspace_id": "ws-top",
             "multica_token": "mdt-top",
             "user_context": {
@@ -48,11 +49,14 @@ def test_im_event_lifts_top_level_workspace_fields() -> None:
             },
         }
     )
+    assert event.team_id == "team-top"
     assert event.workspace_id == "ws-top"
     assert event.multica_token == "mdt-top"
+    assert event.user_context.team_id == "team-top"
     assert event.user_context.workspace_id == "ws-top"
     assert event.user_context.multica_token == "mdt-top"
     assert event.has_workspace_credentials is True
+    assert event.can_query_im_agents is True
 
 
 def test_workspace_default_bot_without_mentions() -> None:

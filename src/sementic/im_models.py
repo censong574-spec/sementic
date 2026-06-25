@@ -15,6 +15,7 @@ class UserContext(BaseModel):
     username: str
     is_bot: bool = False
     ownership: Ownership = Ownership.OTHERS
+    team_id: str | None = None
     workspace_id: str | None = None
     multica_token: str | None = None
 
@@ -45,6 +46,7 @@ class MessageContext(BaseModel):
 class IMMessageEvent(BaseModel):
     event_id: str
     group_session_id: str
+    team_id: str | None = None
     workspace_id: str | None = None
     multica_token: str | None = None
     user_context: UserContext
@@ -58,7 +60,7 @@ class IMMessageEvent(BaseModel):
 
         data = dict(value)
         user_context = dict(data.get("user_context") or {})
-        for field in ("workspace_id", "multica_token"):
+        for field in ("team_id", "workspace_id", "multica_token"):
             top_value = data.get(field)
             if top_value and not user_context.get(field):
                 user_context[field] = top_value
@@ -67,15 +69,19 @@ class IMMessageEvent(BaseModel):
 
     @model_validator(mode="after")
     def normalize_workspace_context(self) -> IMMessageEvent:
+        team_id = self.team_id or self.user_context.team_id
         workspace_id = self.workspace_id or self.user_context.workspace_id
         multica_token = self.multica_token or self.user_context.multica_token
         updates: dict[str, str | None] = {}
+        if team_id != self.user_context.team_id:
+            updates["team_id"] = team_id
         if workspace_id != self.user_context.workspace_id:
             updates["workspace_id"] = workspace_id
         if multica_token != self.user_context.multica_token:
             updates["multica_token"] = multica_token
         if updates:
             self.user_context = self.user_context.model_copy(update=updates)
+        self.team_id = team_id
         self.workspace_id = workspace_id
         self.multica_token = multica_token
         return self
@@ -83,3 +89,7 @@ class IMMessageEvent(BaseModel):
     @property
     def has_workspace_credentials(self) -> bool:
         return self.user_context.has_workspace_credentials
+
+    @property
+    def can_query_im_agents(self) -> bool:
+        return bool((self.team_id or "").strip() and (self.user_context.user_id or "").strip())

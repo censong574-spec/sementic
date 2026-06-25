@@ -15,6 +15,7 @@ import argparse
 import base64
 import io
 import os
+import secrets
 import sys
 import tarfile
 import textwrap
@@ -34,6 +35,7 @@ CLEANUP_SH = SCRIPTS / "cleanup.sh"
 CONFIG_PATH = SCRIPTS / "remote.toml"
 DEPLOY_ENV_PATH = SCRIPTS / "deploy.env"
 WORKER_LOCAL_ENV = REPO_ROOT / ".env"
+SHARED_SERVICE_TOKEN_REDIS_KEY = "shared:service_token"
 
 
 def resolve_packages(cfg: dict[str, Any]) -> list[tuple[Path, str]]:
@@ -227,13 +229,60 @@ def _resolve_mm_egress_config(
 def _remote_mm_external_ingress_ready(client: paramiko.SSHClient) -> bool:
     code, stdout, _ = run(
         client,
-        "redis-cli GET shared:service_token 2>/dev/null || true",
+        f"redis-cli GET {SHARED_SERVICE_TOKEN_REDIS_KEY} 2>/dev/null || true",
         check=False,
     )
     if code != 0:
         return False
     token = stdout.strip()
     return bool(token) and token not in {"(nil)", "nil"}
+
+
+def _read_remote_shared_service_token(client: paramiko.SSHClient) -> str:
+    _, stdout, _ = run(
+        client,
+        f"redis-cli GET {SHARED_SERVICE_TOKEN_REDIS_KEY} 2>/dev/null || true",
+        check=False,
+    )
+    token = stdout.strip()
+    if not token or token in {"(nil)", "nil"}:
+        return ""
+    return token
+
+
+def _resolve_shared_service_token(
+    client: paramiko.SSHClient,
+    deploy_env: dict[str, str],
+) -> str:
+    for key in ("MM_EXTERNAL_INGRESS_TOKEN", "SHARED_SERVICE_TOKEN"):
+        value = (deploy_env.get(key) or os.environ.get(key) or "").strip()
+        if value:
+            return value
+    existing = _read_remote_shared_service_token(client)
+    if existing:
+        return existing
+    return secrets.token_urlsafe(32)
+
+
+def _shell_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def ensure_shared_service_token(client: paramiko.SSHClient, deploy_env: dict[str, str]) -> str:
+    """Preset Redis shared:service_token for sementic-worker MM egress only."""
+    token = _resolve_shared_service_token(client, deploy_env)
+    run(
+        client,
+        f"redis-cli SET {SHARED_SERVICE_TOKEN_REDIS_KEY} {_shell_single_quote(token)}",
+    )
+    verify = _read_remote_shared_service_token(client)
+    if verify != token:
+        raise RuntimeError("failed to preset shared:service_token in redis")
+    print(
+        f"worker mm egress: redis {SHARED_SERVICE_TOKEN_REDIS_KEY} preset",
+        flush=True,
+    )
+    return token
 
 
 def connect(settings: DeploySettings) -> paramiko.SSHClient:
@@ -458,6 +507,7 @@ def upload_code(client: paramiko.SSHClient, settings: DeploySettings) -> None:
 
 def push_config(client: paramiko.SSHClient, settings: DeploySettings) -> None:
     deploy_env = _load_dotenv(DEPLOY_ENV_PATH)
+    ensure_shared_service_token(client, deploy_env)
     mm = _resolve_mm_egress_config(client, settings, deploy_env)
     gateway_env = render_gateway_env(settings)
     worker_env = render_worker_env(settings, mm=mm)

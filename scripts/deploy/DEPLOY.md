@@ -71,6 +71,7 @@ copy scripts\deploy\deploy.env.example scripts\deploy\deploy.env
 full
  ├── 上传 gateway + worker 代码，pip install
  ├── 写入 .env + systemd（worker 依赖 temporal-server + postgresql-14-custom）
+ ├── 预设 Redis `shared:service_token`（worker MM egress 用，不修改 Mattermost）
  ├── [auto_deploy] Temporal 栈
  │    ├── bootstrap_postgres.sh   → 若 :5432 不可达则 init + systemd
  │    ├── 创建 temporal / temporal_visibility 库

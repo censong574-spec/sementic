@@ -68,7 +68,7 @@ llm_timeout_seconds = 180
 redis_url = "redis://127.0.0.1:6379/0"
 kafka_bootstrap_servers = "127.0.0.1:9092"
 kafka_topic = "im.messages"
-bot_agents_url = "http://127.0.0.1:8080/api/agents"
+bot_agents_url = "http://127.0.0.1:8080/api/im/mattermost/agents"
 redis_key_prefix = "channel:history"
 
 # In-process MAOS (merged maos_runtime); requires temporal-server on same host

@@ -43,7 +43,7 @@ class WorkerSettings(BaseSettings):
 
 
 class BotServiceSettings(BaseSettings):
-    """Multica agents listing endpoint (GET /api/agents, full URL without query)."""
+    """Multica IM agents listing (GET /api/im/mattermost/agents)."""
 
     model_config = SettingsConfigDict(
         env_prefix="SEMENTIC_BOT_",
@@ -52,7 +52,7 @@ class BotServiceSettings(BaseSettings):
         extra="ignore",
     )
 
-    agents_url: str = ""
+    agents_url: str = "http://127.0.0.1:8080/api/im/mattermost/agents"
     timeout_seconds: float = 5.0
 
 

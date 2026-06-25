@@ -208,13 +208,13 @@ class MessageHandler:
         mentions: list[MentionRegistryItem],
         event: IMMessageEvent,
     ) -> list[BotProfile]:
-        if self.bot_service.enabled and event.has_workspace_credentials:
+        if self.bot_service.enabled and event.can_query_im_agents:
             try:
                 bots = await self.bot_service.resolve_workspace_agents_for_orchestration(
-                    workspace_id=event.workspace_id or "",
+                    team_id=event.team_id or "",
+                    owner_user_id=event.user_context.user_id,
                     sender_user_id=sender_user_id,
                     mentions=mentions,
-                    multica_token=event.multica_token or "",
                 )
                 if bots or not event.has_workspace_credentials:
                     return bots
