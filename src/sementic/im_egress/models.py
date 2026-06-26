@@ -13,6 +13,7 @@ class EgressKind(str, Enum):
 @dataclass(frozen=True)
 class EgressContext:
     event_id: str
+    trace_id: str
     channel_id: str
     root_post_id: str
     bot_user_id: str

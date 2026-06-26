@@ -67,12 +67,12 @@ class RedisHistoryStore:
         content: str,
         msg_id: str | None = None,
     ) -> StoredChatMessage:
-        message = StoredChatMessage(
-            msg_id=msg_id or f"egress:{bot_user_id}:{int(datetime.now(timezone.utc).timestamp() * 1000)}",
-            sender_id=bot_user_id,
-            sender_name=bot_username,
+        message = self._bot_reply_message(
+            group_session_id=group_session_id,
+            bot_user_id=bot_user_id,
+            bot_username=bot_username,
             content=content,
-            is_bot=True,
+            msg_id=msg_id,
         )
         key = self._key(group_session_id)
         async with self.redis.pipeline(transaction=True) as pipe:
@@ -80,6 +80,54 @@ class RedisHistoryStore:
             pipe.ltrim(key, 0, self.settings.max_messages - 1)
             await pipe.execute()
         return message
+
+    def append_bot_reply_blocking(
+        self,
+        *,
+        group_session_id: str,
+        bot_user_id: str,
+        bot_username: str,
+        content: str,
+        msg_id: str | None = None,
+    ) -> StoredChatMessage:
+        """Sync Redis write for egress threads that run outside the main asyncio loop."""
+        import redis as sync_redis
+
+        message = self._bot_reply_message(
+            group_session_id=group_session_id,
+            bot_user_id=bot_user_id,
+            bot_username=bot_username,
+            content=content,
+            msg_id=msg_id,
+        )
+        key = self._key(group_session_id)
+        client = sync_redis.Redis.from_url(self.settings.url, decode_responses=True)
+        try:
+            with client.pipeline(transaction=True) as pipe:
+                pipe.lpush(key, message.to_json())
+                pipe.ltrim(key, 0, self.settings.max_messages - 1)
+                pipe.execute()
+        finally:
+            client.close()
+        return message
+
+    @staticmethod
+    def _bot_reply_message(
+        *,
+        group_session_id: str,
+        bot_user_id: str,
+        bot_username: str,
+        content: str,
+        msg_id: str | None,
+    ) -> StoredChatMessage:
+        _ = group_session_id
+        return StoredChatMessage(
+            msg_id=msg_id or f"egress:{bot_user_id}:{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+            sender_id=bot_user_id,
+            sender_name=bot_username,
+            content=content,
+            is_bot=True,
+        )
 
     async def get_recent(
         self,

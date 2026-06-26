@@ -31,9 +31,11 @@ def build_egress_context(
     if not bot_user_id:
         return None
 
-    root_post_id = mattermost_post_id(event.message_context.msg_id)
+    # Channel-level replies only; never thread under the triggering post id.
+    root_post_id = mattermost_post_id(event.message_context.parent_msg_id)
     return EgressContext(
         event_id=event.event_id,
+        trace_id=event.trace_id,
         channel_id=event.group_session_id,
         root_post_id=root_post_id,
         bot_user_id=bot_user_id,

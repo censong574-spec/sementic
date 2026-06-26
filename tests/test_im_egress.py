@@ -64,6 +64,36 @@ def _plan() -> TaskGraphPlan:
     )
 
 
+def test_build_egress_context_ignores_trigger_post_id_for_root() -> None:
+    event = IMMessageEvent.model_validate(
+        {
+            "event_id": "z9a6ejxftirodmpkmewi6zr46r",
+            "group_session_id": "channel_1",
+            "user_context": {
+                "user_id": "user",
+                "username": "alice",
+                "is_bot": False,
+                "ownership": "OTHERS",
+            },
+            "message_context": {
+                "msg_id": "z9a6ejxftirodmpkmewi6zr46r",
+                "content": "写 LED 代码",
+                "mentions_registry": [],
+            },
+        }
+    )
+    bots = [
+        BotProfile(
+            bot_user_id="bot_codex",
+            display_name="codex-desktop",
+            role="coding",
+        )
+    ]
+    ctx = build_egress_context(event, _plan(), bots)
+    assert ctx is not None
+    assert ctx.root_post_id == ""
+
+
 def test_build_egress_context_uses_run_task_agent() -> None:
     bots = [
         BotProfile(
@@ -148,7 +178,7 @@ def test_mattermost_client_external_ingress(monkeypatch: pytest.MonkeyPatch) -> 
     transport = httpx.MockTransport(handler)
     with httpx.Client(transport=transport) as http_client:
 
-        def patched_do_post(url, *, headers, payload, bot_user_id):
+        def patched_do_post(url, *, headers, payload, bot_user_id, trace_id=""):
             response = http_client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             return response.json()
@@ -159,6 +189,7 @@ def test_mattermost_client_external_ingress(monkeypatch: pytest.MonkeyPatch) -> 
             channel_id="channel_1",
             root_post_id="abcdefghijklmnopqrstuvwxyz",
             message="hello mm",
+            trace_id="tr_egress_test_001",
         )
 
     assert result == {"id": "post_1"}
@@ -167,6 +198,7 @@ def test_mattermost_client_external_ingress(monkeypatch: pytest.MonkeyPatch) -> 
     assert captured["headers"]["x-mm-external-post-as-user-id"] == "bot_codex"
     assert captured["json"]["user_id"] == "bot_codex"
     assert captured["json"]["root_id"] == "abcdefghijklmnopqrstuvwxyz"
+    assert captured["json"]["props"] == {"sementic_trace_id": "tr_egress_test_001"}
 
 
 def test_mattermost_client_omits_invalid_root_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -183,7 +215,7 @@ def test_mattermost_client_omits_invalid_root_id(monkeypatch: pytest.MonkeyPatch
     transport = httpx.MockTransport(handler)
     with httpx.Client(transport=transport) as http_client:
 
-        def patched_do_post(url, *, headers, payload, bot_user_id):
+        def patched_do_post(url, *, headers, payload, bot_user_id, trace_id=""):
             response = http_client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             return response.json()
@@ -222,9 +254,55 @@ async def test_im_egress_publisher_posts_final_and_writes_redis() -> None:
         channel_id="channel_1",
         root_post_id="",
         message="final result text",
+        trace_id=ctx.trace_id,
     )
     recent = await history.get_recent("channel_1", count=5)
     assert len(recent) == 1
     assert recent[0].is_bot is True
     assert recent[0].sender_name == "codex-desktop"
     assert recent[0].content == "final result text"
+
+
+@pytest.mark.asyncio
+async def test_im_egress_publisher_returns_post_when_async_redis_append_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    client.post_reply.return_value = {"id": "post_bot_1"}
+
+    redis = FakeRedis(decode_responses=True)
+    history = RedisHistoryStore(redis, RedisSettings(max_messages=20, planner_window=10))
+    publisher = ImEgressPublisher(client=client, history_store=history)
+    ctx = build_egress_context(_event(), _plan(), [
+        BotProfile(
+            bot_user_id="bot_codex",
+            display_name="codex-desktop",
+            role="coding",
+        )
+    ])
+    assert ctx is not None
+
+    async def failing_append(**_kwargs):
+        raise RuntimeError("got Future attached to a different loop")
+
+    blocking_calls: list[dict] = []
+
+    def blocking_append(**kwargs):
+        blocking_calls.append(kwargs)
+        return history._bot_reply_message(
+            group_session_id=kwargs["group_session_id"],
+            bot_user_id=kwargs["bot_user_id"],
+            bot_username=kwargs["bot_username"],
+            content=kwargs["content"],
+            msg_id=kwargs.get("msg_id"),
+        )
+
+    monkeypatch.setattr(history, "append_bot_reply", failing_append)
+    monkeypatch.setattr(history, "append_bot_reply_blocking", blocking_append)
+
+    result = await publisher.publish_final(ctx, "final result text")
+
+    assert result == {"id": "post_bot_1"}
+    client.post_reply.assert_called_once()
+    assert len(blocking_calls) == 1
+    assert blocking_calls[0]["msg_id"] == "post_bot_1"

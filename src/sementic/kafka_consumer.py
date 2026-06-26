@@ -34,7 +34,8 @@ async def process_kafka_message(
     event = parse_kafka_ingress_payload(payload)
     await handler.handle(event)
     logger.info(
-        "kafka message processed event_id=%s channel=%s is_bot=%s",
+        "kafka message processed trace_id=%s event_id=%s channel=%s is_bot=%s",
+        event.trace_id,
         event.event_id,
         event.group_session_id,
         event.user_context.is_bot,

@@ -54,6 +54,21 @@ def test_enrich_plan_sets_graph_id_and_agent_id() -> None:
     assert agent["agent_name"] == "Jira Helper"
 
 
+def test_enrich_plan_sets_trace_id() -> None:
+    plan = _sample_plan()
+    bots = [
+        BotProfile(
+            bot_user_id="bot_jira_123",
+            display_name="Jira Helper",
+            role="assistant",
+        )
+    ]
+
+    enriched = enrich_plan_for_execution(plan, bots, trace_id="tr_plan_1")
+
+    assert enriched.graph.input["sementic_trace_id"] == "tr_plan_1"
+
+
 def test_enrich_plan_sets_multica_job_backend_without_planner_backend() -> None:
     plan = TaskGraphPlan(
         confidence=0.8,

@@ -105,6 +105,7 @@ class InMemoryKafkaProducer(KafkaProducer):
 def _build_kafka_payload(event: IMMessageEvent) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "event_id": event.event_id,
+        "trace_id": event.trace_id,
         "group_session_id": event.group_session_id,
         "user_context": event.user_context.model_dump(mode="json"),
         "message_context": event.message_context.model_dump(mode="json"),

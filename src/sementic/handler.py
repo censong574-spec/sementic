@@ -7,9 +7,12 @@ from pydantic import BaseModel, Field
 
 from sementic.bot_registry import BotRegistry
 from sementic.bot_service import BotServiceClient
+from sementic.direct_chat import DirectChatCompletionWatcher, DirectChatRouter
 from sementic.execution.maos_executor import MaosExecutor
 from sementic.execution.plan_enricher import enrich_plan_for_execution
+from sementic.im_egress.models import EgressContext
 from sementic.im_egress.context import build_egress_context
+from sementic.im_egress.mm_ids import mattermost_post_id
 from sementic.im_egress.publisher import ImEgressPublisher
 from sementic.im_egress.watcher import MaosCompletionWatcher
 from sementic.im_models import IMMessageEvent, MentionRegistryItem
@@ -32,6 +35,8 @@ class PlanMessageResponse(BaseModel):
     task_intent: TaskIntentDecision | None = None
     plan: TaskGraphPlan | None = None
     maos_task_ids: list[str] = Field(default_factory=list)
+    direct_chat_session_id: str | None = None
+    direct_chat_task_id: str | None = None
 
 
 class MessageHandler:
@@ -46,6 +51,8 @@ class MessageHandler:
         maos_executor: MaosExecutor | None = None,
         im_egress: ImEgressPublisher | None = None,
         maos_completion_watcher: MaosCompletionWatcher | None = None,
+        direct_chat_router: DirectChatRouter | None = None,
+        direct_chat_completion_watcher: DirectChatCompletionWatcher | None = None,
     ) -> None:
         self.history_store = history_store
         self.planner = planner
@@ -55,6 +62,8 @@ class MessageHandler:
         self.maos_executor = maos_executor
         self.im_egress = im_egress
         self.maos_completion_watcher = maos_completion_watcher
+        self.direct_chat_router = direct_chat_router
+        self.direct_chat_completion_watcher = direct_chat_completion_watcher
 
     async def handle(self, event: IMMessageEvent) -> PlanMessageResponse:
         stored = await self.history_store.append(event)
@@ -74,6 +83,68 @@ class MessageHandler:
         recent = await self.history_store.get_recent(event.group_session_id)
         history_messages = self._history_for_prompt(event, recent)
 
+        owned_bots = await self._resolve_owned_bots(
+            sender_user_id=event.user_context.user_id,
+            mentions=event.message_context.mentions_registry,
+            event=event,
+        )
+
+        direct_chat = None
+        if self.direct_chat_router is not None:
+            try:
+                direct_chat = await self.direct_chat_router.maybe_submit(
+                    event=event,
+                    owned_bots=owned_bots,
+                )
+            except Exception:
+                logger.exception(
+                    "direct chat submission failed event_id=%s group=%s",
+                    event.event_id,
+                    event.group_session_id,
+                )
+                return PlanMessageResponse(
+                    event_id=event.event_id,
+                    group_session_id=event.group_session_id,
+                    stored_message_id=stored.msg_id,
+                    history_window_size=len(recent),
+                    skipped_planning=True,
+                    skip_reason="direct_chat_failed",
+                )
+
+        if direct_chat is not None:
+            context = EgressContext(
+                event_id=event.event_id,
+                trace_id=event.trace_id,
+                channel_id=event.group_session_id,
+                root_post_id=mattermost_post_id(event.message_context.parent_msg_id),
+                bot_user_id=direct_chat.bot.bot_user_id,
+                bot_username=direct_chat.bot.display_name,
+                plan_id=f"direct-chat:{direct_chat.session_id}",
+                maos_task_id=direct_chat.task_id,
+            )
+            if self.direct_chat_completion_watcher is not None:
+                self.direct_chat_completion_watcher.watch(
+                    session_id=direct_chat.session_id,
+                    task_id=direct_chat.task_id,
+                    context=context,
+                )
+            else:
+                logger.warning(
+                    "direct chat submitted without completion watcher event_id=%s task_id=%s",
+                    event.event_id,
+                    direct_chat.task_id,
+                )
+            return PlanMessageResponse(
+                event_id=event.event_id,
+                group_session_id=event.group_session_id,
+                stored_message_id=stored.msg_id,
+                history_window_size=len(recent),
+                skipped_planning=True,
+                skip_reason="direct_chat_submitted",
+                direct_chat_session_id=direct_chat.session_id,
+                direct_chat_task_id=direct_chat.task_id,
+            )
+
         task_intent = await self.intent_classifier.classify(
             channel_id=event.group_session_id,
             sender_display_name=event.user_context.username,
@@ -91,11 +162,6 @@ class MessageHandler:
                 task_intent=task_intent,
             )
 
-        owned_bots = await self._resolve_owned_bots(
-            sender_user_id=event.user_context.user_id,
-            mentions=event.message_context.mentions_registry,
-            event=event,
-        )
         if not owned_bots:
             return PlanMessageResponse(
                 event_id=event.event_id,
@@ -131,6 +197,7 @@ class MessageHandler:
                 plan,
                 owned_bots,
                 event_id=event.event_id,
+                trace_id=event.trace_id,
             )
             maos_task_ids = await asyncio.to_thread(self.maos_executor.submit_plan, plan)
             if (

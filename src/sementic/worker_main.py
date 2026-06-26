@@ -7,6 +7,7 @@ from redis.asyncio import Redis
 
 from sementic.bot_registry import BotRegistry
 from sementic.config import ImEgressSettings, KafkaSettings, MaosObserverSettings, MaosSettings, RedisSettings, WorkerSettings
+from sementic.direct_chat import DirectChatCompletionWatcher, DirectChatRouter, DirectChatSessionStore
 from sementic.execution.maos_executor import MaosExecutor
 from sementic.handler import MessageHandler
 from sementic.im_egress.client import MattermostPostClient
@@ -16,6 +17,7 @@ from sementic.intent_classifier import TaskIntentClassifier
 from sementic.kafka_consumer import KafkaConsumerThread
 from sementic.llm import MockIntentLLMClient, create_intent_llm_client, create_llm_client
 from sementic.maos_observer.server import start_observer_server_if_enabled
+from sementic.multica_chat_client import MulticaChatClient
 from sementic.planner import Planner
 from sementic.redis_history import RedisHistoryStore
 
@@ -52,6 +54,12 @@ def build_message_handler(
     redis_settings = RedisSettings()
     history_store = RedisHistoryStore(redis_client, redis_settings)
     egress_settings = ImEgressSettings()
+    maos_settings = MaosSettings()
+    chat_client = MulticaChatClient(api_base=maos_settings.multica_job_api_base)
+    direct_chat_router = DirectChatRouter(
+        client=chat_client,
+        session_store=DirectChatSessionStore(redis_client),
+    )
     mm_client = MattermostPostClient(egress_settings)
     im_egress = (
         ImEgressPublisher(client=mm_client, history_store=history_store)
@@ -65,6 +73,13 @@ def build_message_handler(
             egress_publisher=im_egress,
             settings=egress_settings,
         )
+    direct_chat_completion_watcher = None
+    if im_egress is not None:
+        direct_chat_completion_watcher = DirectChatCompletionWatcher(
+            client=chat_client,
+            egress_publisher=im_egress,
+            settings=egress_settings,
+        )
     return MessageHandler(
         history_store=history_store,
         intent_classifier=TaskIntentClassifier(llm=_build_intent_llm_client()),
@@ -73,6 +88,8 @@ def build_message_handler(
         maos_executor=maos_executor,
         im_egress=im_egress,
         maos_completion_watcher=maos_completion_watcher,
+        direct_chat_router=direct_chat_router,
+        direct_chat_completion_watcher=direct_chat_completion_watcher,
     )
 
 
@@ -85,12 +102,13 @@ def main() -> None:
     observer_settings = MaosObserverSettings()
 
     logger.info(
-        "sementic worker starting redis=%s kafka=%s topic=%s group=%s maos_temporal=%s mm_egress=%s observer=%s",
+        "sementic worker starting redis=%s kafka=%s topic=%s group=%s maos_temporal=%s multica_chat=%s mm_egress=%s observer=%s",
         redis_settings.url,
         kafka_settings.bootstrap_servers,
         kafka_settings.topic,
         kafka_settings.group_id,
         maos_settings.temporal_address,
+        maos_settings.multica_job_api_base,
         ImEgressSettings().url or "(disabled)",
         f"http://0.0.0.0:{observer_settings.port}"
         if observer_settings.enabled

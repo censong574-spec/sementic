@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -39,6 +40,7 @@ class ImEgressPublisher:
                 channel_id=context.channel_id,
                 root_post_id=context.root_post_id,
                 message=text,
+                trace_id=context.trace_id,
             )
         except Exception:
             logger.exception(
@@ -53,14 +55,61 @@ class ImEgressPublisher:
             msg_id = str(post.get("id") or f"egress:{context.event_id}:{kind.value}")
             if kind == EgressKind.NODE and node_id:
                 msg_id = str(post.get("id") or f"egress:{context.event_id}:node:{node_id}")
-            await self.history_store.append_bot_reply(
-                group_session_id=context.channel_id,
+            await self._append_bot_reply_to_history(
+                channel_id=context.channel_id,
                 bot_user_id=context.bot_user_id,
                 bot_username=context.bot_username,
                 content=text,
                 msg_id=msg_id,
+                event_id=context.event_id,
+                kind=kind.value,
             )
         return post
+
+    async def _append_bot_reply_to_history(
+        self,
+        *,
+        channel_id: str,
+        bot_user_id: str,
+        bot_username: str,
+        content: str,
+        msg_id: str,
+        event_id: str,
+        kind: str,
+    ) -> None:
+        assert self.history_store is not None
+        kwargs = {
+            "group_session_id": channel_id,
+            "bot_user_id": bot_user_id,
+            "bot_username": bot_username,
+            "content": content,
+            "msg_id": msg_id,
+        }
+        try:
+            await self.history_store.append_bot_reply(**kwargs)
+        except Exception:
+            logger.warning(
+                "async redis append failed after mattermost post; retrying sync "
+                "event_id=%s kind=%s bot=%s",
+                event_id,
+                kind,
+                bot_user_id,
+                exc_info=True,
+            )
+            try:
+                await asyncio.to_thread(
+                    self.history_store.append_bot_reply_blocking,
+                    **kwargs,
+                )
+            except Exception:
+                logger.warning(
+                    "sync redis append failed after mattermost post "
+                    "event_id=%s kind=%s bot=%s",
+                    event_id,
+                    kind,
+                    bot_user_id,
+                    exc_info=True,
+                )
 
     async def publish_node(
         self,

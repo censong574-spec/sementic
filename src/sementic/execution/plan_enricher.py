@@ -9,6 +9,7 @@ def enrich_plan_for_execution(
     bots: list[BotProfile],
     *,
     event_id: str | None = None,
+    trace_id: str | None = None,
 ) -> TaskGraphPlan:
     """Prepare a planner graph for in-process MAOS / Temporal execution."""
     enriched = plan.model_copy(deep=True)
@@ -18,6 +19,8 @@ def enrich_plan_for_execution(
     graph_input.setdefault("sementic_plan_id", plan.plan_id)
     if event_id:
         graph_input.setdefault("sementic_event_id", event_id)
+    if trace_id:
+        graph_input.setdefault("sementic_trace_id", trace_id)
     enriched.graph.input = graph_input
 
     bot_index = _bot_index(bots)

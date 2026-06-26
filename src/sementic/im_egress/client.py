@@ -29,6 +29,7 @@ class MattermostPostClient:
         channel_id: str,
         root_post_id: str,
         message: str,
+        trace_id: str = "",
     ) -> dict[str, Any] | None:
         if not self.enabled:
             logger.info("mattermost egress disabled; skip post channel=%s", channel_id)
@@ -42,6 +43,7 @@ class MattermostPostClient:
                 root_post_id=root_post_id,
                 message=message,
                 token=external_token,
+                trace_id=trace_id,
             )
 
         token = self.settings.token_for_bot(bot_user_id)
@@ -58,13 +60,22 @@ class MattermostPostClient:
             "channel_id": channel_id,
             "message": message,
         }
+        props = _egress_post_props(trace_id)
+        if props:
+            payload["props"] = props
         root_id = mattermost_post_id(root_post_id)
         if root_id:
             payload["root_id"] = root_id
         url = f"{self.settings.url.rstrip('/')}/api/v4/posts"
         headers = {"Authorization": f"Bearer {token}"}
 
-        return self._do_post(url, headers=headers, payload=payload, bot_user_id=bot_user_id)
+        return self._do_post(
+            url,
+            headers=headers,
+            payload=payload,
+            bot_user_id=bot_user_id,
+            trace_id=trace_id,
+        )
 
     def _redis_key(self) -> str:
         key = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
@@ -100,12 +111,16 @@ class MattermostPostClient:
         root_post_id: str,
         message: str,
         token: str,
+        trace_id: str = "",
     ) -> dict[str, Any] | None:
         payload: dict[str, Any] = {
             "channel_id": channel_id,
             "user_id": bot_user_id,
             "message": message,
         }
+        props = _egress_post_props(trace_id)
+        if props:
+            payload["props"] = props
         root_id = mattermost_post_id(root_post_id)
         if root_id:
             payload["root_id"] = root_id
@@ -115,7 +130,13 @@ class MattermostPostClient:
             "X-MM-External-Ingress-Token": token,
             "X-MM-External-Post-As-User-Id": bot_user_id,
         }
-        return self._do_post(url, headers=headers, payload=payload, bot_user_id=bot_user_id)
+        return self._do_post(
+            url,
+            headers=headers,
+            payload=payload,
+            bot_user_id=bot_user_id,
+            trace_id=trace_id,
+        )
 
     def _do_post(
         self,
@@ -124,15 +145,24 @@ class MattermostPostClient:
         headers: dict[str, str],
         payload: dict[str, Any],
         bot_user_id: str,
+        trace_id: str = "",
     ) -> dict[str, Any] | None:
         with httpx.Client(timeout=self.settings.timeout_seconds, trust_env=False) as client:
             response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             body = response.json()
             logger.info(
-                "mattermost egress posted bot_user_id=%s channel=%s post_id=%s",
+                "mattermost egress posted bot_user_id=%s channel=%s post_id=%s trace_id=%s",
                 bot_user_id,
                 payload.get("channel_id"),
                 body.get("id"),
+                trace_id or "",
             )
             return body
+
+
+def _egress_post_props(trace_id: str) -> dict[str, str] | None:
+    trace = (trace_id or "").strip()
+    if not trace:
+        return None
+    return {"sementic_trace_id": trace}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -45,12 +46,23 @@ class MessageContext(BaseModel):
 
 class IMMessageEvent(BaseModel):
     event_id: str
+    trace_id: str = ""
     group_session_id: str
     team_id: str | None = None
     workspace_id: str | None = None
     multica_token: str | None = None
     user_context: UserContext
     message_context: MessageContext
+
+    @model_validator(mode="before")
+    @classmethod
+    def ensure_trace_id(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if not str(data.get("trace_id") or "").strip():
+            data["trace_id"] = f"tr_{uuid.uuid4().hex}"
+        return data
 
     @model_validator(mode="before")
     @classmethod
